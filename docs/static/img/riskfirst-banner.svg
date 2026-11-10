@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" role="img" aria-labelledby="title desc">
+  <title id="title">RiskFirst</title>
+  <desc id="desc">Risk-aware pull request reviews that keep important changes in view.</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1">
+      <stop stop-color="#0b1423"/>
+      <stop offset="1" stop-color="#172a3c"/>
+    </linearGradient>
+    <linearGradient id="accent" x2="1" y2="1">
+      <stop stop-color="#6ee7c0"/>
+      <stop offset="1" stop-color="#67baff"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="300" rx="28" fill="url(#background)"/>
+  <path d="M0 248H1200" stroke="#315064" stroke-width="1" opacity=".7"/>
+  <g transform="translate(70 58)">
+    <rect x="0" y="0" width="184" height="184" rx="38" fill="#14283b" stroke="#426078" stroke-width="2"/>
+    <path d="M92 29 148 51v44c0 38-23 62-56 80-33-18-56-42-56-80V51l56-22Z" fill="none" stroke="url(#accent)" stroke-width="9" stroke-linejoin="round"/>
+    <path d="M60 82h64M60 105h45M60 128h29" stroke="#d4f7ec" stroke-width="9" stroke-linecap="round"/>
+    <circle cx="126" cy="123" r="16" fill="#75e3c2"/>
+    <path d="m119 123 5 5 9-11" fill="none" stroke="#0b2830" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="300" y="131" fill="#f4f8fb" font-family="Arial, Helvetica, sans-serif" font-size="78" font-weight="700" letter-spacing="-3">RiskFirst</text>
+  <text x="303" y="181" fill="#a9c4d2" font-family="Arial, Helvetica, sans-serif" font-size="28">Keep critical changes in view.</text>
+  <rect x="303" y="218" width="297" height="3" rx="2" fill="url(#accent)"/>
+  <text x="303" y="254" fill="#79e0c2" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700" letter-spacing="3">RISK-AWARE PR REVIEW</text>
+  <g fill="none" stroke="#487083" stroke-width="2" opacity=".55">
+    <path d="M998 62h134M974 100h158M1014 138h118M986 176h146M1028 214h104"/>
+  </g>
+</svg>
