@@ -125,6 +125,33 @@ async def test_risk_aware_opt_in_reaches_review_diff_packing():
 
 
 @pytest.mark.asyncio
+async def test_risk_aware_warns_when_risk_checks_are_disabled():
+    snapshot = snapshot_settings((
+        "pr_reviewer.enable_risk_aware_compression",
+        "pr_reviewer.enable_risk_checks",
+    ))
+    reviewer = _make_reviewer()
+    reviewer._get_prediction = AsyncMock(return_value=CHUNK_A)
+    reviewer.git_provider.get_diff_files.return_value = []
+    reviewer.git_provider.get_pr_file_paths.return_value = []
+    reviewer.git_provider.get_files.return_value = []
+    reviewer.git_provider.get_filtered_diff_file_names.return_value = []
+    get_settings().set("pr_reviewer.enable_risk_aware_compression", True)
+    get_settings().set("pr_reviewer.enable_risk_checks", False)
+    try:
+        with (
+            patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value=("diff", [])),
+            patch("pr_agent.tools.pr_reviewer.get_logger") as get_logger,
+        ):
+            await reviewer._prepare_prediction("model")
+            warning = get_logger.return_value.warning
+            assert warning.called
+            assert "enable_risk_checks is off" in warning.call_args.args[0]
+    finally:
+        restore_settings(snapshot)
+
+
+@pytest.mark.asyncio
 async def test_a_truncated_diff_is_reviewed_chunk_by_chunk_and_merged(chunking_enabled):
     reviewer = _make_reviewer()
     reviewer._get_prediction = AsyncMock(side_effect=[CHUNK_A, CHUNK_B])

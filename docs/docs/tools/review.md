@@ -375,8 +375,8 @@ until the diff fits, and lists the dropped files in the review coverage footer.
 With `enable_risk_aware_compression = true`, `/review` changes the packing order only when the
 diff does not fit. Files with risky change shapes go first, followed by sensitive paths and
 changed tests whose conventional filenames match one of those files (`test_auth.py`,
-`auth_test.py`, `auth.test.ts`, or `auth.spec.ts`). Within each priority level, the existing
-language and patch-size order is retained. This affects both one-call compression and chunked
+`auth_test.py`, `auth.test.ts`, or `auth.spec.ts`), including after a rename that changes the
+source stem. Within each priority level, the existing language and patch-size order is retained. This affects both one-call compression and chunked
 review; it does not add model calls or raise the token limit. The coverage footer still lists
 omitted and clipped files. Risk patterns are heuristics, so a lower-priority file can still
 contain an important bug. Leave `enable_review_coverage_footer` on and treat incomplete reviews
