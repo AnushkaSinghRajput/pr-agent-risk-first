@@ -216,6 +216,7 @@ it cannot verify the status-changing actor or historical defaults. Dismissed fin
 | `enable_intro_text` | true |  |
 | `enable_help_text` | false | Determines whether to include help text in the PR review. |
 | `enable_review_coverage_footer` | true |  |
+| `enable_risk_aware_compression` | false | Prioritize risky files and related tests in oversized /review diffs; requires enable_risk_checks. See docs/docs/tools/review.md. |
 | `enable_large_pr_chunking` | false | large-diff chunking (opt-in). When the token budget leaves files out of the review, split the diff into chunks, review each chunk, and merge the per-chunk results into one review. |
 | `max_number_of_calls` | 3 | maximum number of chunk review calls, used only when enable_large_pr_chunking is true |
 
