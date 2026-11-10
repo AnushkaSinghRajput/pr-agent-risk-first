@@ -138,6 +138,7 @@ COMMENT_OVERRIDABLE_KEYS = {
     }),
     "pr_reviewer": frozenset({
         "enable_help_text", "enable_intro_text", "enable_large_pr_chunking", "enable_review_coverage_footer",
+        "enable_risk_aware_compression",
         "enable_review_labels_effort", "enable_review_labels_security", "extra_instructions",
         "final_update_message", "inline_key_issues", "max_previous_findings_chars",
         "minimal_commits_for_incremental_review", "minimal_minutes_for_incremental_review",

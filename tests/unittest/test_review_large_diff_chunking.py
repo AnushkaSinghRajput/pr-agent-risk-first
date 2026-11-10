@@ -100,6 +100,31 @@ async def test_a_diff_that_fits_is_never_chunked(chunking_enabled):
 
 
 @pytest.mark.asyncio
+async def test_risk_aware_opt_in_reaches_review_diff_packing():
+    snapshot = snapshot_settings(("pr_reviewer.enable_risk_aware_compression",))
+    reviewer = _make_reviewer()
+    reviewer._get_prediction = AsyncMock(return_value=CHUNK_A)
+    reviewer.git_provider.get_diff_files.return_value = [SimpleNamespace(filename="db/migrations/001.sql")]
+    reviewer.git_provider.get_pr_file_paths.return_value = []
+    reviewer.git_provider.get_files.return_value = []
+    reviewer.git_provider.get_filtered_diff_file_names.return_value = []
+    get_settings().set("pr_reviewer.enable_risk_aware_compression", True)
+    try:
+        with (
+            patch("pr_agent.tools.pr_reviewer.build_risk_checks", return_value={
+                "sensitive_paths": [{"file": "db/migrations/001.sql"}],
+                "risky_shapes": [],
+            }),
+            patch("pr_agent.tools.pr_reviewer.get_pr_diff", return_value=("diff", [])) as get_pr_diff,
+        ):
+            await reviewer._prepare_prediction("model")
+    finally:
+        restore_settings(snapshot)
+
+    assert get_pr_diff.call_args.kwargs["file_priority"] == {"db/migrations/001.sql": 2}
+
+
+@pytest.mark.asyncio
 async def test_a_truncated_diff_is_reviewed_chunk_by_chunk_and_merged(chunking_enabled):
     reviewer = _make_reviewer()
     reviewer._get_prediction = AsyncMock(side_effect=[CHUNK_A, CHUNK_B])
