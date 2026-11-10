@@ -47,6 +47,7 @@ from pr_agent.algo.pr_processing import (
 )
 from pr_agent.algo.prompt_fragments import render_diff_hunk_format
 from pr_agent.algo.repo_context import build_repo_context
+from pr_agent.algo.review_file_priority import build_review_file_priority
 from pr_agent.algo.review_finding_state import (
     append_review_state,
     normalize_findings,
@@ -888,6 +889,32 @@ class PRReviewer:
             or t("review.no_major_issues") not in pr_review
         )
 
+    def _get_review_risk_checks(self) -> dict | None:
+        """Reuse one risk scan for diff prioritization and the published review row."""
+        if hasattr(self, "_cached_review_risk_checks"):
+            return self._cached_review_risk_checks
+
+        unfiltered_files = None
+        if hasattr(self.git_provider, "get_pr_file_paths"):
+            try:
+                unfiltered_files = self.git_provider.get_pr_file_paths()
+            except Exception:
+                unfiltered_files = None
+        if not unfiltered_files and hasattr(self.git_provider, "get_files"):
+            try:
+                unfiltered_files = self.git_provider.get_files()
+            except Exception:
+                unfiltered_files = None
+
+        filtered_names = getattr(self.git_provider, "get_filtered_diff_file_names", lambda: [])()
+        if filtered_names:
+            unfiltered_files = list(unfiltered_files or []) + list(filtered_names)
+
+        self._cached_review_risk_checks = build_risk_checks(
+            self.git_provider.get_diff_files(), unfiltered_files=unfiltered_files
+        )
+        return self._cached_review_risk_checks
+
     async def _prepare_prediction(self, model: str) -> None:
         # Each model attempt owns a fresh result. A malformed primary must not
         # leave state that can be mistaken for a successful fallback response.
@@ -933,6 +960,10 @@ class PRReviewer:
             "disable_extra_lines": False,
             "return_remaining_files": True,
         }
+        if _as_bool_setting(get_settings().pr_reviewer.get("enable_risk_aware_compression", False)):
+            risk_checks = self._get_review_risk_checks()
+            self._review_file_priority = build_review_file_priority(self.git_provider.get_diff_files(), risk_checks)
+            diff_kwargs["file_priority"] = self._review_file_priority
         if callable(output_token_reserve):
             diff_kwargs["output_token_reserve"] = output_token_reserve
         if chunking_enabled:
@@ -1016,6 +1047,8 @@ class PRReviewer:
                 "return_coverage": True,
                 "include_filtered_file_names": False,
             }
+            if getattr(self, "_review_file_priority", None):
+                multi_diff_kwargs["file_priority"] = self._review_file_priority
             output_token_reserve = getattr(
                 getattr(self, "ai_handler", None), "get_output_token_reserve", None
             )
@@ -1353,23 +1386,7 @@ class PRReviewer:
         if structural_reach:
             data["review"] = {"structural_reach": structural_reach, **data["review"]}
 
-        unfiltered_files = None
-        if hasattr(self.git_provider, "get_pr_file_paths"):
-            try:
-                unfiltered_files = self.git_provider.get_pr_file_paths()
-            except Exception:
-                unfiltered_files = None
-        if not unfiltered_files and hasattr(self.git_provider, "get_files"):
-            try:
-                unfiltered_files = self.git_provider.get_files()
-            except Exception:
-                unfiltered_files = None
-
-        filtered_names = getattr(self.git_provider, "get_filtered_diff_file_names", lambda: [])()
-        if filtered_names:
-            unfiltered_files = list(unfiltered_files or []) + list(filtered_names)
-
-        risk_checks = build_risk_checks(self.git_provider.get_diff_files(), unfiltered_files=unfiltered_files)
+        risk_checks = self._get_review_risk_checks()
         if risk_checks and risk_checks.get("has_findings"):
             data["review"] = {"risk_checks": risk_checks, **data["review"]}
 
