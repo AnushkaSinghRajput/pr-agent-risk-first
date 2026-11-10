@@ -961,6 +961,11 @@ class PRReviewer:
             "return_remaining_files": True,
         }
         if _as_bool_setting(get_settings().pr_reviewer.get("enable_risk_aware_compression", False)):
+            if not _as_bool_setting(get_settings().pr_reviewer.get("enable_risk_checks", True), default=True):
+                get_logger().warning(
+                    "enable_risk_aware_compression is on but enable_risk_checks is off; "
+                    "packing order is unchanged"
+                )
             risk_checks = self._get_review_risk_checks()
             self._review_file_priority = build_review_file_priority(self.git_provider.get_diff_files(), risk_checks)
             diff_kwargs["file_priority"] = self._review_file_priority

@@ -86,6 +86,30 @@ def test_renamed_sensitive_file_and_matching_test_keep_priority():
     assert priority == {"src/auth.py": 2, "tests/test_auth.py": 1}
 
 
+def test_renamed_risky_file_keeps_test_matched_to_previous_stem():
+    """A rename that changes the stem must still prioritize the old-name test."""
+    source = _file("src/helpers.py", "api_key = 'secret'")
+    source.old_filename = "src/auth.py"
+    test = _file("tests/test_auth.py", "assert check_permission()")
+    priority = build_review_file_priority([source, test], build_risk_checks([source, test]))
+
+    assert priority["src/helpers.py"] == 3
+    assert priority["tests/test_auth.py"] == 1
+
+
+def test_conventional_js_and_go_tests_match_risky_sources():
+    js_source = _file("src/auth.ts", "api_key = 'secret'")
+    js_test = _file("src/auth.test.ts", "expect(true)")
+    go_source = _file("pkg/auth/auth.go", "api_key = 'secret'")
+    go_test = _file("pkg/auth/auth_test.go", "t.Fatal()")
+
+    js_priority = build_review_file_priority([js_source, js_test], build_risk_checks([js_source, js_test]))
+    go_priority = build_review_file_priority([go_source, go_test], build_risk_checks([go_source, go_test]))
+
+    assert js_priority == {"src/auth.ts": 3, "src/auth.test.ts": 1}
+    assert go_priority == {"pkg/auth/auth.go": 3, "pkg/auth/auth_test.go": 1}
+
+
 def test_prepared_and_fresh_chunking_keep_the_same_priority(monkeypatch):
     files = [
         _file("src/ordinary.py", "ordinary " * 12),
