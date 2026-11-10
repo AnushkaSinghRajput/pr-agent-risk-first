@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 
@@ -214,7 +214,8 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
                 large_pr_handling=False,
                 return_remaining_files=False,
                 return_prepared=False,
-                output_token_reserve: Callable[[str, int], int] | None = None):
+                output_token_reserve: Callable[[str, int], int] | None = None,
+                file_priority: Mapping[str, int] | None = None):
     budget = AttemptTokenBudget.for_attempt(
         model, token_handler, output_token_reserve=output_token_reserve
     )
@@ -306,6 +307,7 @@ def get_pr_diff(git_provider: GitProvider, token_handler: TokenHandler,
             hard_token_budget,
             add_line_numbers_to_hunks,
             large_pr_handling,
+            file_priority=file_priority,
         )
 
     if large_pr_handling and len(patches_compressed_list) > 1:
@@ -682,10 +684,21 @@ def pr_generate_extended_diff(pr_languages: list,
     return patches_extended, total_tokens, patches_extended_tokens
 
 
+def _sort_files_for_packing(top_langs: list, file_priority: Mapping[str, int] | None = None) -> list:
+    """Keep the established language/size order within each review priority level."""
+    sorted_files = []
+    for lang in top_langs:
+        sorted_files.extend(sorted(lang['files'], key=lambda file: file.tokens, reverse=True))
+    if file_priority:
+        sorted_files.sort(key=lambda file: -file_priority.get(file.filename, 0))
+    return sorted_files
+
+
 def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler,
                                 soft_token_budget: int, hard_token_budget: int,
                                 convert_hunks_to_line_numbers: bool,
                                 large_pr_handling: bool,
+                                *, file_priority: Mapping[str, int] | None = None,
                                 ) -> tuple[list, list, list, list, dict, list]:
     """Prepare patches using the caller's soft and hard diff-only capacities."""
     deleted_files_list = []
@@ -695,10 +708,7 @@ def pr_generate_compressed_diff(top_langs: list, token_handler: TokenHandler,
             if file.tokens is None or file.tokens < 0:
                 file.tokens = token_handler.count_tokens(file.patch) if file.patch else 0
 
-    # sort each one of the languages in top_langs by the number of tokens in the diff
-    sorted_files = []
-    for lang in top_langs:
-        sorted_files.extend(sorted(lang['files'], key=lambda x: x.tokens, reverse=True))
+    sorted_files = _sort_files_for_packing(top_langs, file_priority)
 
     # generate patches for each file, and count tokens
     file_dict = {}
@@ -953,7 +963,8 @@ def get_pr_multi_diffs(git_provider: GitProvider,
                        output_token_reserve: Callable[[str, int], int] | None = None,
                        include_filtered_file_names: bool = True,
                        deleted_files: list | None = None,
-                       *, return_coverage: bool = False):
+                       *, return_coverage: bool = False,
+                       file_priority: Mapping[str, int] | None = None):
     """
     Retrieves the diff files from a Git provider, sorts them by main language, and generates patches for each file.
     The patches are split into multiple groups based on the maximum number of tokens allowed for the given model.
@@ -971,6 +982,8 @@ def get_pr_multi_diffs(git_provider: GitProvider,
             patch was clipped. Takes precedence over `return_remaining_files`. Defaults to False.
         prepared_diff (PreparedPRDiff, optional): Reuse compressed file data prepared by a preceding
             `get_pr_diff` call for the same model attempt. Defaults to None.
+        file_priority (Mapping[str, int], optional): Put higher-priority files first when chunking is needed.
+            A prepared diff already carries its packing order. Defaults to None.
 
     Returns:
         List[str]: A list of final diff strings, split into multiple groups based on the maximum number
@@ -1067,13 +1080,10 @@ def get_pr_multi_diffs(git_provider: GitProvider,
     # Release the discarded full diff before constructing chunked patches.
     del patches_extended
 
-    # Sort files within each language group by tokens in descending order
-    sorted_files = []
-    for lang in pr_languages:
-        sorted_files.extend(sorted(lang['files'], key=lambda x: x.tokens, reverse=True))
+    sorted_files = _sort_files_for_packing(pr_languages, file_priority)
 
     # Build the same transformed file dictionary used by the prepared path, preserving the
-    # descending token order established above. The shared packer then owns chunk boundaries,
+    # priority and token order established above. The shared packer then owns chunk boundaries,
     # large-patch policy, and remaining-file tracking for both paths.
     file_dict = {}
     for file in sorted_files:
