@@ -142,6 +142,10 @@ for the authoritative default values.
     <td>If set to true, the tool will display a review coverage footer when the token budget leaves files out of the review.</td>
   </tr>
   <tr>
+    <td><b>enable_risk_aware_compression</b></td>
+    <td>When a review exceeds the token budget, pack files with deterministic risk findings first, then sensitive paths and their changed tests. Requires <code>enable_risk_checks</code>. Full-diff reviews are unchanged. Default is false.</td>
+  </tr>
+  <tr>
     <td><b>enable_large_pr_chunking</b></td>
     <td>If set to true, and the token budget leaves files out of the review, the diff is split into chunks, each chunk is reviewed separately, and the per-chunk results are merged into one review. See <a href="#reviewing-a-pr-that-does-not-fit-in-one-call">Reviewing a PR that does not fit in one call</a>. Default is false.</td>
   </tr>
@@ -367,6 +371,23 @@ Use triple quotes to write multi-line instructions. Use bullet points to make th
 
 When a PR diff is larger than the model's token budget, the `review` tool drops whole files
 until the diff fits, and lists the dropped files in the review coverage footer.
+
+With `enable_risk_aware_compression = true`, `/review` changes the packing order only when the
+diff does not fit. Files with risky change shapes go first, followed by sensitive paths and
+changed tests whose conventional filenames match one of those files (`test_auth.py`,
+`auth_test.py`, `auth.test.ts`, or `auth.spec.ts`). Within each priority level, the existing
+language and patch-size order is retained. This affects both one-call compression and chunked
+review; it does not add model calls or raise the token limit. The coverage footer still lists
+omitted and clipped files. Risk patterns are heuristics, so a lower-priority file can still
+contain an important bug. Leave `enable_review_coverage_footer` on and treat incomplete reviews
+as incomplete.
+
+Enable it in host configuration or `.pr_agent.toml`:
+
+```toml
+[pr_reviewer]
+enable_risk_aware_compression = true
+```
 
 Setting `enable_large_pr_chunking = true` changes what happens next: the diff is split into up
 to `max_number_of_calls` chunks, each chunk is reviewed on its own, and the answers are merged
