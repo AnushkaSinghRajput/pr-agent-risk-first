@@ -48,7 +48,11 @@ def build_review_file_priority(diff_files: list[Any], risk_checks: dict | None) 
         level = 3 if paths & shape_paths else 2 if paths & sensitive_paths else 0
         if level:
             priority[name] = level
+            # Keep both names so a rename like auth.py -> helpers.py still
+            # pairs with tests/test_auth.py under the token budget.
             risky_stems.add(PurePosixPath(name).stem)
+            if old_name:
+                risky_stems.add(PurePosixPath(old_name).stem)
 
     for file in diff_files:
         name = normalize_file_path(getattr(file, "filename", None))
