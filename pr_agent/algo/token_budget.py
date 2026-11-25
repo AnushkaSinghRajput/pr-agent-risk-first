@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlsplit
 
 from jinja2 import StrictUndefined
 from jinja2.sandbox import SandboxedEnvironment
@@ -11,7 +13,7 @@ from pr_agent.algo import (
     GPT6_MAX_INPUT_TOKENS,
     GPT6_MODELS,
     GPT6_OPENROUTER_ROUTING_SUFFIXES,
-    GPT6_SOL_TIER_MODELS,
+    GPT6_PROVIDER_BRIDGE_MODELS,
     MAX_TOKENS,
 )
 from pr_agent.algo.token_handler import TokenEncoder, TokenHandler
@@ -25,6 +27,10 @@ DEFAULT_TRUNCATION_MARKER = "\n...(truncated)\n"
 
 class FallbackEligibleError(ValueError):
     """Represent a model-specific output or fit failure that another model may resolve."""
+
+
+class ModelContextPreparationError(FallbackEligibleError):
+    """Signal an unavailable model context lookup, not a prompt fit failure."""
 
 
 def _positive_int(value) -> int | None:
@@ -48,18 +54,45 @@ def _as_int(value, default: int = 0) -> int:
         return default
 
 
-def _gpt6_budget_model(model: str, settings) -> tuple[str, bool]:
+def _endpoint_hostname(api_base: str | None) -> str | None:
+    base = str(api_base).strip() if api_base else ""
+    if base and "://" not in base and not base.startswith("//"):
+        base = f"//{base}"
+    try:
+        return urlsplit(base).hostname if base else None
+    except ValueError:
+        return None
+
+
+def _is_custom_openai_endpoint(api_base: str | None, *, allow_openrouter: bool = False) -> bool:
+    """Distinguish OpenAI-compatible gateways from native OpenAI/Azure endpoints."""
+    hostname = _endpoint_hostname(api_base)
+    return bool(api_base and (not hostname or not (
+        hostname == "api.openai.com" or hostname.endswith(".api.openai.com")
+        or (allow_openrouter and hostname in ("openrouter.ai", "api.openrouter.ai"))
+        or hostname.endswith((
+            ".openai.azure.com", ".cognitiveservices.azure.com", ".services.ai.azure.com",
+            ".openai.azure.us", ".cognitiveservices.azure.us", ".services.ai.azure.us",
+            ".openai.azure.cn", ".cognitiveservices.azure.cn", ".services.ai.azure.cn",
+        ))
+    )))
+
+
+def _gpt6_budget_model(
+    model: str, settings, custom_llm_provider: str | None = None, *, route_api_base: str | None = None,
+    native_route_override: bool | None = None,
+) -> tuple[str, bool]:
     """Resolve a GPT-6 budget alias and identify its native provider route."""
-    custom_llm_provider = str(
-        getattr(getattr(settings, "litellm", None), "custom_llm_provider", "") or ""
-    ).strip().lower()
+    if custom_llm_provider is None:
+        custom_llm_provider = getattr(getattr(settings, "litellm", None), "custom_llm_provider", "")
+    custom_llm_provider = str(custom_llm_provider or "").strip().lower()
     openrouter_route = custom_llm_provider == "openrouter" or (
         not custom_llm_provider and model.startswith("openrouter/")
     )
     model_base = model.removeprefix("openrouter/")
     if model_base.startswith(("azure_ai/", "aiohttp_openai/")):
         provider_model_base = model_base.split("/", 1)[1].removesuffix("_thinking")
-        if provider_model_base in GPT6_SOL_TIER_MODELS:
+        if provider_model_base in GPT6_PROVIDER_BRIDGE_MODELS:
             model_base = provider_model_base
     while model_base.startswith(("openai/", "azure/")):
         model_base = model_base.removeprefix("openai/").removeprefix("azure/")
@@ -70,16 +103,56 @@ def _gpt6_budget_model(model: str, settings) -> tuple[str, bool]:
         custom_llm_provider in ("", "openai", "aiohttp_openai", "azure", "azure_ai")
         and not model.startswith("openrouter/")
     )
+    if model_base == "gpt-6.1-terra" and native_gpt6_route:
+        if native_route_override is not None:
+            return model_base, native_route_override
+        get = getattr(settings, "get", lambda key, default=None: default)
+        configured_base = get("OPENAI.API_BASE", None)
+        openai_base = configured_base or os.getenv("OPENAI_BASE_URL") or os.getenv("OPENAI_API_BASE")
+        if openrouter_route:
+            router_base = get("OPENROUTER.API_BASE", None) or os.getenv("OPENROUTER_API_BASE")
+            router_key = get("OPENROUTER.KEY", None) or os.getenv("OPENROUTER_API_KEY") or os.getenv("OR_API_KEY")
+            if router_base or router_key:
+                api_base = route_api_base or router_base
+            elif get("OPENAI.KEY", None) or os.getenv("OPENAI_API_KEY"):
+                api_base = route_api_base or openai_base
+            else:
+                api_base = route_api_base
+        elif custom_llm_provider == "azure_ai" or (not custom_llm_provider and model.startswith("azure_ai/")):
+            api_base = route_api_base or os.getenv("AZURE_AI_API_BASE")
+        else:
+            azure_type = get("OPENAI.API_TYPE", None) == "azure"
+            azure_ad = bool(get("AZURE_AD.CLIENT_ID", None))
+            azure_route = custom_llm_provider == "azure" or (
+                not custom_llm_provider and (model.startswith("azure/") or azure_type or azure_ad)
+            )
+            if azure_route:
+                api_base = route_api_base or (
+                    (get("AZURE_AD.API_BASE", None) if azure_ad else None)
+                    or (configured_base if azure_type or azure_ad else None)
+                    or os.getenv("AZURE_API_BASE") or configured_base or os.getenv("AZURE_OPENAI_ENDPOINT")
+                )
+            else:
+                api_base = route_api_base or openai_base
+        native_gpt6_route = not _is_custom_openai_endpoint(api_base, allow_openrouter=openrouter_route)
     return model_base, native_gpt6_route
 
 
-def get_max_input_tokens(model: str) -> int | None:
+def get_max_input_tokens(
+    model: str, *, custom_llm_provider: str | None = None, route_api_base: str | None = None,
+    native_route_override: bool | None = None,
+) -> int | None:
     """Return a maintained native input ceiling independently of the total context window."""
-    model_base, native_route = _gpt6_budget_model(model, get_settings())
+    model_base, native_route = _gpt6_budget_model(
+        model, get_settings(), custom_llm_provider, route_api_base=route_api_base,
+        native_route_override=native_route_override,
+    )
     return GPT6_MAX_INPUT_TOKENS.get(model_base) if native_route else None
 
 
-def get_max_tokens(model, ignore_max_model_tokens=False):
+def _resolve_max_tokens(model, ignore_max_model_tokens=False, *, custom_llm_provider: str | None = None,
+                        model_info_lookup=None, route_api_base: str | None = None,
+                        native_route_override: bool | None = None) -> int | None:
     """
     Get the maximum number of tokens allowed for a model.
     logic:
@@ -88,16 +161,23 @@ def get_max_tokens(model, ignore_max_model_tokens=False):
     (3) else if 'config.custom_model_max_tokens' is set to a positive value, use it.
     (4) Resolve a supported GPT-5.x/GPT-6 alias to its registered base-model value.
     (5) else, query LiteLLM for provider-qualified and bare alias bases before the original model.
-    (6) else, raise an error.
+    (6) else, return None so callers can prepare a provider-specific context window.
 
     For all cases, we further limit the number of tokens to 'config.max_model_tokens' if it is set.
-    This aims to improve the algorithmic quality, as the AI model degrades in performance when the input is too long.
+    The clamp keeps the smaller of that value and the model's own limit, so a model with a larger
+    window is not pruned to a smaller budget than it can use. The default (256000) reflects that no
+    degradation was observed at prompt sizes up to 57k tokens in a local /review replay.
     Pass ignore_max_model_tokens=True to keep the unreduced value, for sites that deliberately use the
     raw model context size rather than the conservative clamp.
     """
     settings = get_settings()
     custom_max_tokens = _as_int(settings.config.custom_model_max_tokens)
-    model_base, native_gpt6_route = _gpt6_budget_model(model, settings)
+    model_base, native_gpt6_route = _gpt6_budget_model(
+        model, settings, custom_llm_provider, route_api_base=route_api_base,
+        native_route_override=native_route_override,
+    )
+    # Use custom or LiteLLM metadata limits for non-native Terra routes.
+    use_registered_context = native_gpt6_route or model_base != "gpt-6.1-terra"
     # Resolve supported aliases while preserving custom limits on non-native routes.
     if (
         custom_max_tokens <= 0 and model_base in GPT6_MODELS
@@ -108,6 +188,31 @@ def get_max_tokens(model, ignore_max_model_tokens=False):
     # LiteLLMAIHandler request normalization.
     model_for_max_tokens = model
     litellm_lookup_models = (model,)
+    verify_gateway_alias = False
+    if model_base == "gpt-6.1-terra" and not native_gpt6_route:
+        # Never infer a gateway's context limit from native Terra metadata.
+        provider = str((
+            getattr(getattr(settings, "litellm", None), "custom_llm_provider", "")
+            if custom_llm_provider is None else custom_llm_provider
+        ) or "").strip().lower()
+        if provider in ("openrouter", "azure", "azure_ai") or (
+            provider in ("", "openai", "aiohttp_openai")
+            and model.startswith(("openrouter/", "azure/", "azure_ai/"))
+        ):
+            # Native router/Azure model records cannot establish a custom endpoint's limit.
+            litellm_lookup_models = ()
+        elif provider and provider not in ("openai", "aiohttp_openai"):
+            # Custom deployments must use exact provider-qualified metadata.
+            qualified_alias = model if model.startswith(f"{provider}/") else f"{provider}/{model}"
+            verify_gateway_alias = True
+            litellm_lookup_models = (qualified_alias,)
+        else:
+            # Only use metadata specific to the gateway deployment; native Terra
+            # and its normal OpenAI-qualified identity do not establish a gateway limit.
+            verify_gateway_alias = True
+            litellm_lookup_models = (
+                (model,) if model != model_base and model != f"openai/{model_base}" else ()
+            )
     if isinstance(model, str):
         tmp = model
         while tmp.startswith(("openai/", "azure/")):
@@ -127,50 +232,85 @@ def get_max_tokens(model, ignore_max_model_tokens=False):
             litellm_lookup_models = tuple(dict.fromkeys((provider_model, model_for_max_tokens, model)))
     if model in GPT6_MAX_INPUT_TOKENS and not native_gpt6_route and custom_max_tokens > 0:
         max_tokens_model = custom_max_tokens
-    elif model in MAX_TOKENS:
+    elif model in MAX_TOKENS and use_registered_context:
         max_tokens_model = MAX_TOKENS[model]
     elif custom_max_tokens > 0:
         max_tokens_model = custom_max_tokens
-    elif model_for_max_tokens in MAX_TOKENS:
+    elif model_for_max_tokens in MAX_TOKENS and use_registered_context:
         max_tokens_model = MAX_TOKENS[model_for_max_tokens]
     else:
         # Fallback: ask LiteLLM for the model's metadata before giving up.
         max_tokens_model = 0
-        import litellm
+        if model_info_lookup is None:
+            import litellm
+            model_info_lookup = litellm.get_model_info
+        if verify_gateway_alias:
+            import litellm
+            litellm_lookup_models = tuple(
+                m for m in litellm_lookup_models
+                if _model_info_input_limit(litellm.model_cost.get(m)) is not None
+            )
         # Try provider-qualified and bare bases before the raw alias.
         for lookup_model in litellm_lookup_models:
             try:
-                model_info = litellm.get_model_info(lookup_model)
+                model_info = model_info_lookup(lookup_model)
             except Exception:
                 get_logger().debug(f"litellm.get_model_info could not resolve model '{lookup_model}'")
                 model_info = None
-            if model_info:
-                litellm_max = model_info.get("max_input_tokens")
-                try:
-                    parsed_max_tokens = int(litellm_max)
-                except (TypeError, ValueError, OverflowError):
-                    continue
-                if parsed_max_tokens > 0:
-                    max_tokens_model = parsed_max_tokens
-                    get_logger().debug(
-                        f"Resolved max_input_tokens for '{model}' from litellm "
-                        f"(lookup '{lookup_model}'): {max_tokens_model}"
-                    )
-                    break
+            parsed_max_tokens = _model_info_input_limit(model_info)
+            if parsed_max_tokens is not None:
+                max_tokens_model = parsed_max_tokens
+                get_logger().debug(f"Resolved token limit for '{model}': {max_tokens_model}")
+                break
 
         if max_tokens_model <= 0:
-            message = (
-                f"Unable to resolve a positive input-token limit for model '{model}' from PR-Agent's built-in limits"
-                " or LiteLLM metadata. Set config.custom_model_max_tokens to a verified positive input-token limit."
-                " config.max_model_tokens only caps a resolved limit; it cannot supply a missing model limit."
-            )
-            get_logger().error(message)
-            raise Exception(message)
+            return None
 
     max_model_tokens = _as_int(settings.config.max_model_tokens) if settings.config.max_model_tokens else 0
     if max_model_tokens > 0 and not ignore_max_model_tokens:
         max_tokens_model = min(max_model_tokens, max_tokens_model)
     return max_tokens_model
+
+
+def _model_info_input_limit(model_info) -> int | None:
+    if not model_info:
+        return None
+    try:
+        value = int(model_info.get("max_input_tokens"))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    return value if value > 0 else None
+
+
+def _raise_unresolved_model_limit(model: str):
+    message = (
+        f"Unable to resolve a positive input-token limit for model '{model}' from PR-Agent's built-in limits"
+        " or LiteLLM metadata. Set config.custom_model_max_tokens to a verified positive input-token limit."
+        " config.max_model_tokens only caps a resolved limit; it cannot supply a missing model limit."
+    )
+    get_logger().error(message)
+    raise Exception(message)
+
+
+def get_max_tokens(
+    model, ignore_max_model_tokens=False, *, custom_llm_provider: str | None = None,
+    route_api_base: str | None = None, native_route_override: bool | None = None,
+):
+    """Resolve the existing limit policy, raising when no positive model limit is known."""
+    result = _resolve_max_tokens(
+        model, ignore_max_model_tokens, custom_llm_provider=custom_llm_provider,
+        route_api_base=route_api_base, native_route_override=native_route_override,
+    )
+    if result is None:
+        _raise_unresolved_model_limit(model)
+    return result
+
+
+async def prepare_model_token_limits(ai_handler, model: str) -> None:
+    """Prepare optional model metadata before synchronous prompt budgeting."""
+    prepare = getattr(type(ai_handler), "prepare_model_token_limits", None)
+    if callable(prepare):
+        await prepare(ai_handler, model)
 
 
 def clip_tokens(text: str, max_tokens: int, add_three_dots=True, num_input_tokens=None, delete_last_line=False) -> str:
@@ -206,32 +346,23 @@ def clip_tokens(text: str, max_tokens: int, add_three_dots=True, num_input_token
              Returns empty string if max_tokens <= 0.
 
     Examples:
-        Basic usage:
-        >>> text = "This is a sample text that might be too long"
-        >>> result = clip_tokens(text, max_tokens=10)
-        >>> print(result)
-        This is a sample...
-        (truncated)
+        Basic usage (this text is 15 tokens):
+        >>> text = "This is a sample text that is long enough to be clipped by the function"
+        >>> clip_tokens(text, max_tokens=10)
+        'This is a sample text that is long enough \\n...(truncated)'
 
         Without truncation indicator:
-        >>> result = clip_tokens(text, max_tokens=10, add_three_dots=False)
-        >>> print(result)
-        This is a sample
+        >>> clip_tokens(text, max_tokens=10, add_three_dots=False)
+        'This is a sample text that is long enough '
 
         With pre-computed token count:
-        >>> result = clip_tokens(text, max_tokens=5, num_input_tokens=15)
-        >>> print(result)
-        This...
-        (truncated)
+        >>> clip_tokens(text, max_tokens=5, num_input_tokens=15)
+        'This is a sample text\\n...(truncated)'
 
-        With line deletion:
+        With line deletion (the partial last line is dropped):
         >>> multiline_text = "Line 1\\nLine 2\\nLine 3"
-        >>> result = clip_tokens(multiline_text, max_tokens=3, delete_last_line=True)
-        >>> print(result)
-        Line 1
-        Line 2
-        ...
-        (truncated)
+        >>> clip_tokens(multiline_text, max_tokens=9, delete_last_line=True)
+        'Line 1\\nLine 2\\n...(truncated)'
 
     Notes:
         The function uses a safety factor of 0.9 (10% reduction) to ensure the
@@ -314,13 +445,22 @@ class AttemptTokenBudget:
         bound_token_handler = (
             token_handler.for_model(model) if isinstance(token_handler, TokenHandler) else token_handler
         )
+        ai_handler = getattr(bound_token_handler, "ai_handler", None)
+        resolve_limits = getattr(type(ai_handler), "get_model_token_limits", None)
+        if callable(resolve_limits):
+            context_window, max_input_tokens = resolve_limits(
+                ai_handler, model, ignore_max_model_tokens=ignore_max_model_tokens,
+            )
+        else:
+            context_window = get_max_tokens(model, ignore_max_model_tokens=ignore_max_model_tokens)
+            max_input_tokens = get_max_input_tokens(model)
         return cls(
             model=model,
             source_token_handler=token_handler,
             token_handler=bound_token_handler,
-            context_window=get_max_tokens(model, ignore_max_model_tokens=ignore_max_model_tokens),
+            context_window=context_window,
             output_token_reserve=output_token_reserve,
-            max_input_tokens=get_max_input_tokens(model),
+            max_input_tokens=max_input_tokens,
         )
 
     @classmethod
@@ -345,6 +485,7 @@ class AttemptTokenBudget:
             user_template,
             model=model,
             count_prompt_tokens=False,
+            ai_handler=ai_handler,
         )
         budget = cls.for_attempt(
             model,

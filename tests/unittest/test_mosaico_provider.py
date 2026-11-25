@@ -389,29 +389,6 @@ review:
   security_concerns: 'No'
 """
 
-CANNED_IMPROVE_YAML = """\
-code_suggestions:
-  - relevant_file: existing.py
-    language: python
-    existing_code: |
-      x = 2
-    suggestion_content: 'Consider a named constant instead of a magic number'
-    improved_code: |
-      X = 2
-    one_sentence_summary: 'Use a named constant'
-    label: 'best practice'
-"""
-
-# The /improve flow makes a mandatory second LLM call (self-reflection) that scores
-# each suggestion and injects relevant_lines_start/end. The mock returns this on call 2.
-CANNED_IMPROVE_REFLECTION_YAML = """\
-code_suggestions:
-  - suggestion_score: 8
-    why: 'Improves readability'
-    relevant_lines_start: 1
-    relevant_lines_end: 1
-"""
-
 
 def _setup_request_settings(verb_provider_input):
     """Mimic the per-request isolation the executor will do: deepcopy global_settings
@@ -446,8 +423,8 @@ def isolated_settings():
         global_settings.data = data_before
 
 
-async def _run_tool_via_spy(monkeypatch, isolated_settings, verb, canned_yaml, second_yaml=""):
-    """Patch the provider registry to a spy subclass, mock the LLM, run the tool with
+async def _run_command_via_spy(monkeypatch, isolated_settings, verb, canned_yaml, second_yaml=""):
+    """Patch the provider registry to a spy subclass, mock the LLM, run the command with
     publish_output=False, and return (captured_artifact, incremental_accessed_list)."""
     import pr_agent.algo.ai_handlers.litellm_ai_handler as litellm_mod
     from pr_agent.git_providers import _GIT_PROVIDERS
@@ -460,9 +437,9 @@ async def _run_tool_via_spy(monkeypatch, isolated_settings, verb, canned_yaml, s
     _SpyProvider.incremental_access = incremental_access
     monkeypatch.setitem(_GIT_PROVIDERS, "mosaico_diff", _SpyProvider)
 
-    # The first LLM call is the tool's main prediction (return the canned YAML).
+    # The first LLM call is the command's main prediction (return the canned YAML).
     # Subsequent calls (e.g. /improve's self-reflection scoring) get an empty string,
-    # which makes the tool fall back to its default suggestion score (passes threshold).
+    # which makes the command fall back to its default suggestion score (passes threshold).
     call_count = {"n": 0}
 
     async def fake_chat_completion(self, model, system, user, temperature=0.2, **kwargs):
@@ -484,7 +461,7 @@ async def _run_tool_via_spy(monkeypatch, isolated_settings, verb, canned_yaml, s
 class TestSpikeEndToEnd:
     @pytest.mark.asyncio
     async def test_review_end_to_end(self, monkeypatch, isolated_settings):
-        ok, artifact, incremental = await _run_tool_via_spy(
+        ok, artifact, incremental = await _run_command_via_spy(
             monkeypatch, isolated_settings, "review", CANNED_REVIEW_YAML)
         assert ok is True, "review handle_request returned False (swallowed exception)"
         assert artifact, "review produced empty artifact"
@@ -492,9 +469,9 @@ class TestSpikeEndToEnd:
 
     @pytest.mark.asyncio
     async def test_improve_end_to_end(self, monkeypatch, isolated_settings):
-        ok, artifact, incremental = await _run_tool_via_spy(
-            monkeypatch, isolated_settings, "improve", CANNED_IMPROVE_YAML,
-            second_yaml=CANNED_IMPROVE_REFLECTION_YAML)
+        # /improve runs /review, so it answers from the review prompt.
+        ok, artifact, incremental = await _run_command_via_spy(
+            monkeypatch, isolated_settings, "improve", CANNED_REVIEW_YAML)
         assert ok is True, "improve handle_request returned False (swallowed exception)"
         assert artifact, "improve produced empty artifact"
         assert incremental == [], f"incremental-only methods were accessed: {incremental}"

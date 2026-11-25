@@ -21,6 +21,9 @@ class KeyIssuesComponentLink(BaseModel):
     issue_content: str
     start_line: int
     end_line: int
+    existing_code: str | None = None
+    improved_code: str | None = None
+    confidence: int | None = Field(default=None, ge=0, le=10)
 
 
 class TodoSection(BaseModel):
@@ -60,13 +63,16 @@ class FailureMode(BaseModel):
 
 
 def parse_failure_modes(value: object) -> list[dict]:
-    """Keep at most three valid cases, including when review validation only warns."""
+    """Keep at most three distinct valid cases, including when review validation only warns."""
     modes = []
     for entry in value if isinstance(value, list) else []:
         try:
-            modes.append(FailureMode.model_validate(entry).model_dump())
+            mode = FailureMode.model_validate(entry).model_dump()
         except ValidationError:
             continue
+        if mode in modes:
+            continue
+        modes.append(mode)
         if len(modes) == 3:
             break
     return modes
@@ -135,6 +141,22 @@ def parse_artifact_findings(value: object, artifact_context: dict | None) -> lis
     return findings
 
 
+def finding_confidence(issue: object) -> float | None:
+    """Return a finding's confidence as a number in 0-10, or None when it is absent or unusable.
+
+    Filtering and rendering share this, so a finding is shown with a confidence exactly when
+    the filter compared it.
+    """
+    value = issue.get("confidence") if isinstance(issue, dict) else None
+    if isinstance(value, bool):
+        return None
+    try:
+        confidence = float(str(value).strip())
+    except ValueError:
+        return None
+    return confidence if 0 <= confidence <= 10 else None  # also rejects NaN
+
+
 class Review(BaseModel):
     # extra_instructions and [artifacts] may request fields beyond the prompt schema
     model_config = ConfigDict(extra="allow")
@@ -166,33 +188,6 @@ class PRReview(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     review: Review
-
-
-class CodeSuggestion(BaseModel):
-    relevant_file: str
-    language: str
-    existing_code: str
-    suggestion_content: str
-    improved_code: str
-    one_sentence_summary: str
-    label: str
-
-
-class PRCodeSuggestions(BaseModel):
-    code_suggestions: list[CodeSuggestion]
-
-
-class CodeSuggestionFeedback(BaseModel):
-    suggestion_summary: str
-    relevant_file: str
-    relevant_lines_start: int
-    relevant_lines_end: int
-    suggestion_score: int = Field(ge=0, le=10)
-    why: str
-
-
-class PRCodeSuggestionsFeedback(BaseModel):
-    code_suggestions: list[CodeSuggestionFeedback]
 
 
 class PRType(StrEnum):
@@ -322,13 +317,6 @@ class CodeDocumentation(BaseModel):
         if len(serialized) != len(set(serialized)):
             raise ValueError("Code Documentation items must be unique")
         return items
-
-
-class PRRankResponses(BaseModel):
-    which_response_was_better: Literal[0, 1, 2]
-    why: str
-    score_response1: int = Field(ge=1, le=10)
-    score_response2: int = Field(ge=1, le=10)
 
 
 class RelevantSection(BaseModel):

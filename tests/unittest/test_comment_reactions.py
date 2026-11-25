@@ -5,11 +5,13 @@ a long command could not tell whether it had finished. `add_reaction` is the pro
 primitive; `add_eyes_reaction` and `react_to_outcome` are the two policies built on it.
 """
 import asyncio
+import copy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 from requests.exceptions import RequestException
+from starlette_context import request_cycle_context
 
 from pr_agent.config_loader import get_settings, global_settings
 from pr_agent.git_providers.git_provider import GitProvider, get_reaction_setting
@@ -233,6 +235,22 @@ def test_github_survives_an_api_failure(monkeypatch):
     assert provider.add_reaction(7, "eyes") is None
 
 
+def test_github_reacts_to_a_review_comment_through_its_own_endpoints(monkeypatch):
+    """The issue comment endpoints answer 404 for a comment on a diff line or a file."""
+    provider = _github(monkeypatch)
+    provider.mark_review_comment(7)
+
+    assert provider.add_reaction(7, "eyes") == 99
+    assert provider.remove_reaction(7, 99) is True
+    assert provider.add_reaction(8, "eyes") == 99
+
+    assert [call.args for call in provider.pr._requester.requestJsonAndCheck.call_args_list] == [
+        ("POST", "https://api.github.com/repos/org/repo/pulls/comments/7/reactions"),
+        ("DELETE", "https://api.github.com/repos/org/repo/pulls/comments/7/reactions/99"),
+        ("POST", "https://api.github.com/repos/org/repo/issues/comments/8/reactions"),
+    ]
+
+
 def test_gitlab_awards_the_configured_emoji(monkeypatch):
     provider = GitLabProvider.__new__(GitLabProvider)
     provider.id_mr = 5
@@ -260,8 +278,8 @@ def _comment_event(body="/review"):
 @pytest.fixture
 def comment_handler(monkeypatch):
     """The real handle_comments_on_pr, with only the provider and the agent faked."""
-    import pr_agent.servers.github_app as github_app
     from pr_agent.identity_providers.identity_provider import Eligibility
+    from pr_agent.servers import github_app
 
     provider = _RecordingProvider()
     provider.add_eyes_reaction_calls = []
@@ -322,15 +340,68 @@ async def test_the_default_configuration_adds_only_the_start_reaction(reactions,
     assert provider.removed == []
 
 
+def _review_comment_event(body):
+    return {
+        "action": "created",
+        "comment": {
+            "id": 4243, "body": body, "subject_type": "line", "path": "src/app.py", "side": "RIGHT",
+            "start_line": None, "line": 12, "diff_hunk": "@@ -10,2 +10,3 @@\n+new line",
+            "pull_request_url": "https://api.github.com/repos/org/repo/pulls/1",
+        },
+    }
+
+
+@pytest.mark.parametrize(("event", "payload", "expected"), [
+    # A command in a diff thread gets both reactions on its review comment.
+    ("pull_request_review_comment", _review_comment_event("/review"), [
+        ("POST", "pulls/comments/4243/reactions", "eyes"),
+        ("DELETE", "pulls/comments/4243/reactions/99", None),
+        ("POST", "pulls/comments/4243/reactions", "hooray"),
+    ]),
+    # A question on lines starts without the eyes reaction, but still gets the outcome one.
+    ("pull_request_review_comment", _review_comment_event("/ask Why here?"), [
+        ("POST", "pulls/comments/4243/reactions", "hooray"),
+    ]),
+    ("issue_comment", _comment_event(), [
+        ("POST", "issues/comments/4242/reactions", "eyes"),
+        ("DELETE", "issues/comments/4242/reactions/99", None),
+        ("POST", "issues/comments/4242/reactions", "hooray"),
+    ]),
+])
+async def test_github_app_reacts_on_the_comment_that_ran_the_command(
+    reactions, monkeypatch, event, payload, expected
+):
+    from pr_agent.identity_providers.identity_provider import Eligibility
+    from pr_agent.servers import github_app
+
+    reactions(success="hooray")
+    provider = _github(monkeypatch)
+    monkeypatch.setattr(github_app, "get_git_provider_with_context", lambda pr_url: provider)
+    monkeypatch.setattr(github_app, "get_identity_provider",
+                        lambda: SimpleNamespace(verify_eligibility=lambda *a, **k: Eligibility.ELIGIBLE))
+
+    async def handle_request(api_url, command, notify=None, **_kwargs):
+        notify()
+        return True
+
+    with request_cycle_context({"settings": copy.deepcopy(global_settings)}):
+        await github_app.handle_comments_on_pr(
+            payload, event, "user", "1", "created", {}, SimpleNamespace(handle_request=handle_request))
+
+    calls = provider.pr._requester.requestJsonAndCheck.call_args_list
+    assert [(call.args[0], call.args[1].removeprefix("https://api.github.com/repos/org/repo/"),
+             call.kwargs.get("input", {}).get("content")) for call in calls] == expected
+
+
 @pytest.mark.asyncio
-async def test_a_swallowed_tool_failure_gets_a_failure_outcome(
+async def test_a_swallowed_command_failure_gets_a_failure_outcome(
     reactions, comment_handler, monkeypatch
 ):
-    """Keep compatibility-swallowed tool failures from becoming success reactions."""
+    """Keep compatibility-swallowed command failures from becoming success reactions."""
     import pr_agent.agent.pr_agent as pr_agent_module
 
     reactions(success="hooray", failure="confused")
-    monkeypatch.setitem(get_settings().config, "propagate_tool_errors", False)
+    monkeypatch.setitem(get_settings().config, "propagate_command_errors", False)
     monkeypatch.setattr(pr_agent_module, "enforce_request_policy", lambda _url: None)
     monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda _pr_url: None)
     monkeypatch.setattr(pr_agent_module.CliArgs, "validate_user_args", lambda _args: (True, None))
@@ -338,21 +409,21 @@ async def test_a_swallowed_tool_failure_gets_a_failure_outcome(
 
     observed_propagation = []
 
-    class SwallowingReviewTool:
+    class SwallowingReviewCommand:
         def __init__(self, _pr_url, ai_handler=None, args=None):
             pass
 
         async def run(self):
             observed_propagation.append(
-                get_settings().config.get("propagate_tool_errors", False)
+                get_settings().config.get("propagate_command_errors", False)
             )
             try:
                 raise RuntimeError("provider unavailable")
             except RuntimeError:
-                if get_settings().config.get("propagate_tool_errors", False):
+                if get_settings().config.get("propagate_command_errors", False):
                     raise
 
-    monkeypatch.setitem(pr_agent_module.command2class, "review", SwallowingReviewTool)
+    monkeypatch.setitem(pr_agent_module.command2class, "review", SwallowingReviewCommand)
 
     github_app, provider = comment_handler
     agent = pr_agent_module.PRAgent(ai_handler="fake-ai")
@@ -364,7 +435,7 @@ async def test_a_swallowed_tool_failure_gets_a_failure_outcome(
     assert observed_propagation == [True]
     assert provider.reactions == [(4242, "eyes"), (4242, "confused")]
     assert provider.removed == [(4242, 1)]
-    assert get_settings().config.get("propagate_tool_errors") is False
+    assert get_settings().config.get("propagate_command_errors") is False
 
 
 @pytest.mark.asyncio
@@ -380,11 +451,11 @@ async def test_incomplete_files_constructor_failure_is_visible_and_marked_failed
     monkeypatch.setattr(pr_agent_module.CliArgs, "validate_user_args", lambda _args: (True, None))
     monkeypatch.setattr(pr_agent_module, "update_settings_from_args", lambda args: args)
 
-    class IncompleteReviewTool:
+    class IncompleteReviewCommand:
         def __init__(self, _pr_url, ai_handler=None, args=None):
             raise pr_agent_module.IncompletePullRequestFilesError("private mismatch details")
 
-    monkeypatch.setitem(pr_agent_module.command2class, "review", IncompleteReviewTool)
+    monkeypatch.setitem(pr_agent_module.command2class, "review", IncompleteReviewCommand)
 
     github_app, provider = comment_handler
     provider.publish_comment = MagicMock()
@@ -413,29 +484,29 @@ async def test_documentation_and_label_failures_get_failure_outcomes(
 ):
     """Verify that documentation and label command failures get failure reactions."""
     import pr_agent.agent.pr_agent as pr_agent_module
-    from pr_agent.tools import pr_add_docs, pr_generate_labels
+    from pr_agent.commands import pr_add_docs, pr_generate_labels
 
     reactions(success="hooray", failure="confused")
     settings = get_settings()
-    monkeypatch.setitem(settings.config, "propagate_tool_errors", False)
+    monkeypatch.setitem(settings.config, "propagate_command_errors", False)
     monkeypatch.setitem(settings.config, "publish_output", False)
     monkeypatch.setattr(pr_agent_module, "enforce_request_policy", lambda _url: None)
     monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda _pr_url: None)
     monkeypatch.setattr(pr_agent_module.CliArgs, "validate_user_args", lambda _args: (True, None))
     monkeypatch.setattr(pr_agent_module, "update_settings_from_args", lambda args: args)
 
-    tool_module = pr_add_docs if command == "add_docs" else pr_generate_labels
-    tool_class = pr_agent_module.command2class[command]
+    command_module = pr_add_docs if command == "add_docs" else pr_generate_labels
+    command_class = pr_agent_module.command2class[command]
 
-    def init_tool(self, *_args, **_kwargs):
+    def init_command(self, *_args, **_kwargs):
         self.git_provider = MagicMock()
         self.pr_id = "org/repo#1"
 
     async def fail_before_publishing(*_args, **_kwargs):
         raise RuntimeError("provider unavailable")
 
-    monkeypatch.setattr(tool_class, "__init__", init_tool)
-    monkeypatch.setattr(tool_module, "retry_with_fallback_models", fail_before_publishing)
+    monkeypatch.setattr(command_class, "__init__", init_command)
+    monkeypatch.setattr(command_module, "retry_with_fallback_models", fail_before_publishing)
 
     github_app, provider = comment_handler
     agent = pr_agent_module.PRAgent(ai_handler="fake-ai")
@@ -446,7 +517,7 @@ async def test_documentation_and_label_failures_get_failure_outcomes(
 
     assert provider.reactions == [(4242, "eyes"), (4242, "confused")]
     assert provider.removed == [(4242, 1)]
-    assert get_settings().config.get("propagate_tool_errors") is False
+    assert get_settings().config.get("propagate_command_errors") is False
 
 
 @pytest.mark.asyncio
@@ -454,7 +525,7 @@ async def test_contextless_propagation_override_isolated_from_concurrent_request
     import pr_agent.agent.pr_agent as pr_agent_module
 
     assert get_settings() is global_settings
-    monkeypatch.setitem(global_settings.config, "propagate_tool_errors", False)
+    monkeypatch.setitem(global_settings.config, "propagate_command_errors", False)
     monkeypatch.setattr(pr_agent_module, "enforce_request_policy", lambda _url: None)
     monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda _pr_url: None)
     monkeypatch.setattr(pr_agent_module.CliArgs, "validate_user_args", lambda _args: (True, None))
@@ -464,27 +535,27 @@ async def test_contextless_propagation_override_isolated_from_concurrent_request
     default_observed = asyncio.Event()
     observed = {}
 
-    class WaitingTool:
+    class WaitingCommand:
         def __init__(self, pr_url, ai_handler=None, args=None):
             self.pr_url = pr_url
 
         async def run(self):
-            observed[self.pr_url] = get_settings().config.get("propagate_tool_errors", False)
+            observed[self.pr_url] = get_settings().config.get("propagate_command_errors", False)
             if self.pr_url == "override":
                 override_started.set()
                 await default_observed.wait()
             else:
                 await override_started.wait()
                 observed["default_during_override"] = get_settings().config.get(
-                    "propagate_tool_errors", False
+                    "propagate_command_errors", False
                 )
                 default_observed.set()
 
-    monkeypatch.setitem(pr_agent_module.command2class, "review", WaitingTool)
+    monkeypatch.setitem(pr_agent_module.command2class, "review", WaitingCommand)
     agent = pr_agent_module.PRAgent(ai_handler="fake-ai")
 
     override_result, default_result = await asyncio.gather(
-        agent.handle_request("override", ["review"], propagate_tool_errors=True),
+        agent.handle_request("override", ["review"], propagate_command_errors=True),
         agent.handle_request("default", ["review"]),
     )
 
@@ -495,4 +566,4 @@ async def test_contextless_propagation_override_isolated_from_concurrent_request
         "default": False,
         "default_during_override": False,
     }
-    assert global_settings.config.get("propagate_tool_errors") is False
+    assert global_settings.config.get("propagate_command_errors") is False

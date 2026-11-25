@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import unquote
 
 import pytest
+from starlette_context import context, request_cycle_context
 
 from pr_agent.agent import pr_agent as pr_agent_module
 from pr_agent.algo.run_details import record_command_failure
@@ -86,23 +87,96 @@ def test_addressed_pr_comment_becomes_threaded_ask():
                        "__pr_agent_encoded_text__:check%20this%20PR")
 
 
-def test_addressed_comment_without_line_range_becomes_threaded_ask():
+FILE_QUESTION_CONTEXT_KEYS = (
+    "file_question_path",
+    "file_question_comment_id",
+    "file_question_origin_comment_id",
+    "file_question_comment_url",
+)
+# A thread on a whole file: its context has the file's path and no line range.
+FILE_THREAD_CONTEXT = SimpleNamespace(
+    file_path="/src/app.cs",
+    left_file_start=None,
+    left_file_end=None,
+    right_file_start=None,
+    right_file_end=None,
+)
+
+
+async def _dispatch_comment_event(content, thread_context):
+    """Deliver a comment in thread 22 to the webhook handler and return each request it hands to PRAgent, with the
+    file question recorded in the request context at that point."""
     provider = MagicMock()
     provider.get_agent_mention_aliases.return_value = AGENT_ALIASES
-    provider.get_thread_context.return_value = SimpleNamespace(
-        file_path="/src/app.cs",
-        left_file_start=None,
-        left_file_end=None,
-        right_file_start=None,
-        right_file_end=None,
-    )
+    provider.get_thread_context.return_value = thread_context
+    provider.get_pr_url.return_value = URL
+    dispatched = []
 
-    command = webhook.handle_line_comment(
-        "@<agent@example.com> check this thread", thread_id=22, comment_id=31, provider=provider
-    )
+    class RecordingAgent:
+        async def handle_request(self, pr_url, request, notify=None, propagate_command_errors=None):
+            dispatched.append((pr_url, request, {key: context.get(key) for key in FILE_QUESTION_CONTEXT_KEYS}))
+            return True
 
-    assert command == ("/ask --comment_id=22 --origin_comment_id=31 "
-                       "__pr_agent_encoded_text__:check%20this%20thread")
+    event = {
+        "eventType": "ms.vss-code.git-pullrequest-comment-event",
+        "resourceVersion": "2.0",
+        "resource": {
+            "comment": {
+                "id": 31,
+                "content": content,
+                "_links": {"threads": {
+                    "href": "https://dev.azure.com/org/_apis/git/repositories/repo/pullRequests/1/threads/22",
+                }},
+            },
+            "pullRequest": {"pullRequestId": 1, "repository": {"webUrl": "https://dev.azure.com/org/proj/_git/repo"}},
+        },
+    }
+    with request_cycle_context({}), patch.object(webhook, "PRAgent", RecordingAgent), \
+            patch.object(webhook, "get_git_provider_with_context", return_value=provider):
+        response = await webhook.handle_request_azure(event, {})
+    assert response.status_code == 202
+    return dispatched
+
+
+@pytest.mark.parametrize("comment", [
+    "/ask check this file",
+    "/ask_question check this file",
+    "@<agent@example.com> check this file",
+])
+async def test_question_in_a_thread_on_a_whole_file_is_asked_about_that_file(comment):
+    dispatched = await _dispatch_comment_event(comment, FILE_THREAD_CONTEXT)
+
+    # Answered in the thread from that file's diff, with the thread's other comments as history.
+    assert dispatched == [(
+        URL,
+        "/ask --comment_id=22 --origin_comment_id=31 __pr_agent_encoded_text__:check%20this%20file",
+        {
+            "file_question_path": "/src/app.cs",
+            "file_question_comment_id": 22,
+            "file_question_origin_comment_id": 31,
+            "file_question_comment_url": f"{URL}?discussionId=22",
+        },
+    )]
+
+
+@pytest.mark.parametrize(("thread_context", "expected_request"), [
+    # A thread on the PR has no context: the question is about the whole PR.
+    (None, "/ask --comment_id=22 --origin_comment_id=31 __pr_agent_encoded_text__:check%20this"),
+    # Without a file path there is no file to ask about.
+    (SimpleNamespace(**{**vars(FILE_THREAD_CONTEXT), "file_path": None}),
+     "/ask --comment_id=22 --origin_comment_id=31 __pr_agent_encoded_text__:check%20this"),
+    (SimpleNamespace(**{**vars(FILE_THREAD_CONTEXT), "file_path": " "}),
+     "/ask --comment_id=22 --origin_comment_id=31 __pr_agent_encoded_text__:check%20this"),
+    # A question on lines becomes /ask_line.
+    (SimpleNamespace(**{**vars(FILE_THREAD_CONTEXT), "right_file_start": SimpleNamespace(line=8),
+                        "right_file_end": SimpleNamespace(line=10)}),
+     "/ask_line --line_start=8 --line_end=10 --side=right --file_name=%2Fsrc%2Fapp.cs --file_name_encoded=true "
+     "--comment_id=22 --origin_comment_id=31 __pr_agent_encoded_text__:check%20this"),
+])
+async def test_question_outside_a_thread_on_a_whole_file_records_no_file_question(thread_context, expected_request):
+    dispatched = await _dispatch_comment_event("/ask check this", thread_context)
+
+    assert dispatched == [(URL, expected_request, dict.fromkeys(FILE_QUESTION_CONTEXT_KEYS))]
 
 
 def test_addressed_comment_uses_available_line_position():
@@ -123,23 +197,25 @@ def test_addressed_comment_uses_available_line_position():
                        "--origin_comment_id=31 __pr_agent_encoded_text__:check%20this")
 
 
-def test_slash_ask_does_not_require_agent_identity_discovery():
+@pytest.mark.parametrize("ask_command", ["/ask", "/ask_question"])
+def test_slash_ask_does_not_require_agent_identity_discovery(ask_command):
     provider = MagicMock()
     provider.get_thread_context.return_value = None
 
-    command = webhook.handle_line_comment("/ask check this PR", 22, 31, provider)
+    command = webhook.handle_line_comment(f"{ask_command} check this PR", 22, 31, provider)
 
     assert command == ("/ask --comment_id=22 --origin_comment_id=31 "
                        "__pr_agent_encoded_text__:check%20this%20PR")
     provider.get_agent_mention_aliases.assert_not_called()
 
 
-def test_slash_ask_keeps_explicit_cli_overrides_out_of_the_question():
+@pytest.mark.parametrize("ask_command", ["/ask", "/ask_question"])
+def test_slash_ask_keeps_explicit_cli_overrides_out_of_the_question(ask_command):
     provider = MagicMock()
     provider.get_thread_context.return_value = None
 
     command = webhook.handle_line_comment(
-        '/ask --pr_questions.extra_instructions="be terse" what does this do?', 22, 31, provider
+        f'{ask_command} --pr_questions.extra_instructions="be terse" what does this do?', 22, 31, provider
     )
     lexer = shlex.shlex(command.replace("'", "\\'"), posix=True)
     lexer.whitespace_split = True
@@ -153,7 +229,8 @@ def test_slash_ask_keeps_explicit_cli_overrides_out_of_the_question():
                for call in settings.return_value.set.call_args_list)
 
 
-def test_slash_ask_line_keeps_explicit_cli_overrides_out_of_the_question():
+@pytest.mark.parametrize("ask_command", ["/ask", "/ask_question"])
+def test_slash_ask_line_keeps_explicit_cli_overrides_out_of_the_question(ask_command):
     provider = MagicMock()
     provider.get_thread_context.return_value = SimpleNamespace(
         file_path="/src/app.cs",
@@ -163,7 +240,9 @@ def test_slash_ask_line_keeps_explicit_cli_overrides_out_of_the_question():
         right_file_end=SimpleNamespace(line=8),
     )
 
-    command = webhook.handle_line_comment("/ask --pr_questions.extra_instructions=terse why?", 22, 31, provider)
+    command = webhook.handle_line_comment(
+        f"{ask_command} --pr_questions.extra_instructions=terse why?", 22, 31, provider
+    )
 
     assert "--pr_questions.extra_instructions=terse" in command
     assert command.endswith("__pr_agent_encoded_text__:why%3F")
@@ -292,13 +371,13 @@ def test_empty_slash_ask_is_preserved():
 
 class _SwallowingReview:
     """Stand-in for a command that hits its own error and returns normally anyway, which is what
-    the real tools do while `propagate_tool_errors` is false (see pr_reviewer.py:458-464)."""
+    the real commands do while `propagate_command_errors` is false (see pr_reviewer.py:458-464)."""
 
     def __init__(self, pr_url, ai_handler=None, args=None):
         self.observed_propagation = None
 
     async def run(self):
-        self.observed_propagation = get_settings().config.get("propagate_tool_errors", False)
+        self.observed_propagation = get_settings().config.get("propagate_command_errors", False)
         record_command_failure()
         if self.observed_propagation:
             raise RuntimeError("the model call failed")
@@ -312,17 +391,17 @@ class _CleanReview:
         self.ran = True
 
 
-async def _run_comment_command(body, tool_class, monkeypatch):
-    """Drive the comment endpoint through the real agent so the settings the tool sees are the
-    ones the handler asked for, and return the provider plus the tool instance."""
+async def _run_comment_command(body, command_class, monkeypatch):
+    """Drive the comment endpoint through the real agent so the settings the command sees are the
+    ones the handler asked for, and return the provider plus the command instance."""
     provider = MagicMock()
     provider.get_thread_context.return_value = None
     built = []
 
     def build(*args, **kwargs):
-        tool = tool_class(*args, **kwargs)
-        built.append(tool)
-        return tool
+        command = command_class(*args, **kwargs)
+        built.append(command)
+        return command
 
     monkeypatch.setitem(pr_agent_module.command2class, "review", build)
     monkeypatch.setattr(pr_agent_module, "enforce_request_policy", lambda _url: None)
@@ -332,26 +411,26 @@ async def _run_comment_command(body, tool_class, monkeypatch):
     return provider, built[0]
 
 
-async def test_swallowed_tool_failure_does_not_resolve_the_thread(monkeypatch):
-    """Resolving the discussion on a run that raised inside the tool leaves the author a closed
+async def test_swallowed_command_failure_does_not_resolve_the_thread(monkeypatch):
+    """Resolving the discussion on a run that raised inside the command leaves the author a closed
     thread and no review, so the handler must demand an honest verdict the way the GitHub comment
     path does. The "On it!" reply is posted before the command runs, so it still has to be cleaned
-    up on that failed run, like the temporary comments the tools remove in their finally blocks."""
+    up on that failed run, like the temporary comments the commands remove in their finally blocks."""
 
-    provider, tool = await _run_comment_command("/review", _SwallowingReview, monkeypatch)
+    provider, command = await _run_comment_command("/review", _SwallowingReview, monkeypatch)
 
     provider.set_thread_status.assert_not_called()
     provider.remove_initial_comment.assert_called_once()
-    assert tool.observed_propagation is True
+    assert command.observed_propagation is True
 
 
 async def test_successful_command_still_resolves_the_thread(monkeypatch):
     """The companion guard: a run that raised nothing must keep closing the thread, so the fix is
     not just "never close"."""
 
-    provider, tool = await _run_comment_command("/review", _CleanReview, monkeypatch)
+    provider, command = await _run_comment_command("/review", _CleanReview, monkeypatch)
 
-    assert tool.ran is True
+    assert command.ran is True
     provider.set_thread_status.assert_called_once_with(7, "closed")
     provider.remove_initial_comment.assert_called_once()
 

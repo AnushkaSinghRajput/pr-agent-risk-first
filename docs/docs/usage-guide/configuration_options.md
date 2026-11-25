@@ -3,7 +3,7 @@ title: "Configuration File"
 sidebar_position: 3
 ---
 
-The different tools and sub-tools used by PR-Agent are adjustable via a Git configuration file.
+The different commands and sub-commands used by PR-Agent are adjustable via a Git configuration file.
 There are three main ways to set persistent configurations:
 
 1. [Local](./configuration_options.md#local-configuration-file) configuration file
@@ -14,25 +14,27 @@ In terms of precedence, local configurations will override global configurations
 
 
 For a list of all possible configurations, see the [configuration options](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml) page, or the rendered [Configuration Reference](./configuration_reference.md) which lists every option grouped by section.
-In addition to general configuration options, each tool has its own configurations. For example, the `review` tool will use parameters from the [pr_reviewer](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml) section in the configuration file.
+In addition to general configuration options, each command has its own configurations. For example, the `review` command will use parameters from the [pr_reviewer](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml) section in the configuration file.
 
 :::tip[Tip1: Edit only what you need]
 Your configuration file should be minimal, and edit only the relevant values. Don't copy the entire configuration options, since it can lead to legacy problems when something changes.
 :::
 
 :::tip[Tip2: Show relevant configurations]
-If you set `config.output_relevant_configurations` to True, each tool will also output in a collapsible section its relevant configurations. This can be useful for debugging, or getting to know the configurations better.
+If you set `config.output_relevant_configurations` to True, each command will also output in a collapsible section its relevant configurations. This can be useful for debugging, or getting to know the configurations better.
 :::
 
 
 
 ## Local configuration file
 
-`Platforms supported: GitHub, GitLab, Bitbucket, Azure DevOps`
+`Platforms supported: GitHub, GitLab, Bitbucket Cloud, Bitbucket Server, Azure DevOps, Gitea, Gerrit, CodeCommit`
 
-By uploading a local `.pr_agent.toml` file to the root of the repo's default branch, you can customize parameters that support repository-level overrides. Note that you need to upload or update `.pr_agent.toml` before using the PR Agent tools (either at PR creation or via manual trigger) for the configuration to take effect.
+By placing a local `.pr_agent.toml` file at the repository root on the ref read by your Git provider (usually the default branch; see the provider branch behavior below), you can customize parameters that support repository-level overrides. Note that you need to upload or update `.pr_agent.toml` before using the PR Agent commands (either at PR creation or via manual trigger) for the configuration to take effect.
 
 Provider endpoint settings are host-controlled: `openai.api_base`, `openai.api_type`, `openai.api_version`, `azure_ad.api_base`, `databricks.api_base`, `huggingface.api_base`, `moonshot.api_base`, `ollama.api_base`, and `openrouter.api_base` are ignored when set in repository-local `.pr_agent.toml` and must be configured on the host. The same restriction applies to provider authentication and TLS settings: `github.deployment_type`, `bitbucket.auth_type`, `gitlab.auth_type`, `gitlab.ssl_verify`, `gitea.skip_ssl_verification`, and `gitea.ssl_ca_cert`. Jira ticket lookups run with the host's Atlassian credentials, so `jira.cloud_id`, `jira.jira_site`, `jira.jira_api_email`, and `jira.project_keys` are host-controlled as well. These settings are also rejected in command arguments.
+
+For Gitea, enable repository-local settings in the host environment with `GITEA__REPO_SETTING=.pr_agent.toml`; this setting is unset by default.
 
 For example, if you set in `.pr_agent.toml`:
 
@@ -45,7 +47,7 @@ extra_instructions="""\
 """
 ```
 
-Then you can give a list of extra instructions to the `review` tool.
+Then you can give a list of extra instructions to the `review` command.
 
 ### Loading the local configuration from a non-default branch
 
@@ -73,8 +75,9 @@ By default, configuration is read from the **default branch**, so only users who
 :::note[Provider branch behavior]
 Branch selection is currently implemented for GitHub and GitLab. Gitea ignores these options and reads
 the local `.pr_agent.toml` from the pull request target ref, which may differ from the default branch.
-Gerrit also ignores these options, but reads the file from the cloned default branch. Other platforms
-retain their provider-specific settings source.
+Gerrit also ignores these options, but reads the file from the cloned default branch. CodeCommit reads
+it from the first pull request target's destination commit, including on multi-target pull requests.
+Other platforms retain their provider-specific settings source.
 :::
 
 ## Global configuration file
@@ -150,7 +153,7 @@ Set `use_group_settings_file = false` to disable subgroup lookups while preservi
 
 ## External configuration URL
 
-`Platforms supported: GitHub, GitLab, Bitbucket, Azure DevOps`
+`Platforms supported: GitHub, GitLab, Bitbucket Cloud, Bitbucket Server, Azure DevOps, Gitea, Gerrit, CodeCommit`
 
 When running PR-Agent from the CLI (or any wrapper that exposes its arguments), you can merge an additional `.pr_agent.toml` from any URL or local path before the repo-local and global configurations are applied. This is useful when:
 
@@ -177,6 +180,8 @@ Accepted values:
 
 GitLab comment webhooks apply this host layer before their first provider lookup; repository and per-directory settings remain part of normal command dispatch.
 
+For automatic PR/MR webhooks in GitHub App, GitLab, Gitea, Bitbucket Cloud, Azure DevOps Server, and Bitbucket Server, an external source that cannot be read (for example a failed fetch, an oversized file, or a path that is not a `.toml` file) skips the event and logs a warning, because the host exclusions and `system_instructions` could not be applied. The next webhook tries the source again. Manual commands and CLI runs keep running with the settings that did load.
+
 GitLab tokens obtained from a secret provider during webhook authentication remain bound to that request. External files and environment reapplication cannot replace those authenticated credentials.
 
 ### Authentication for private endpoints
@@ -202,7 +207,7 @@ External-URL settings are applied **first**, so every other layer overrides them
 built-in defaults
   < --extra_config_url
     < global pr-agent-settings
-      < local .pr_agent.toml (repo default branch)
+      < local .pr_agent.toml (provider-specific ref)
         < environment variables (SECTION__KEY)
 ```
 
@@ -215,5 +220,3 @@ The external file is loaded through the same secure loader as the repo-local `.p
 - Limits the response size to **1 MB**
 - Uses a **10-second** request timeout
 - Only accepts `http`, `https`, `file` schemes (or a bare local path)
-
-If the fetch fails, the request is logged and PR-Agent continues with the remaining configuration layers.

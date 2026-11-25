@@ -103,7 +103,6 @@ FORBIDDEN_ARGS = [
     "--github.api_retries=3",
     '--github={"ratelimit_retries": 3}',
     "--config.ai_timeout=300",
-    "--pr_code_suggestions.max_number_of_calls=10",
     # description_issue_regex is compiled and run with finditer over the whole pull-request
     # description. An ambiguous pattern backtracks exponentially, so a commenter who can choose
     # it can burn a worker on a short body; it stays an operator choice.
@@ -133,16 +132,23 @@ FORBIDDEN_ARGS = [
     "--azure_devops_server.agent_identity=attacker",
     "--azure_devops_server__agent_identity=attacker",
     '--azure_devops_server={"agent_identity": "attacker"}',
-    # fail_on_tool_errors decides whether a recorded tool failure fails the GitHub Action, so a
+    # fail_on_command_errors decides whether a recorded command failure fails the GitHub Action, so a
     # commenter must not be able to turn it off for their own command.
-    "--github_action_config.fail_on_tool_errors=false",
-    "--GITHUB_ACTION_CONFIG.FAIL_ON_TOOL_ERRORS=false",
-    "--github_action_config__fail_on_tool_errors=false",
-    '--github_action_config={"fail_on_tool_errors": false}',
+    "--github_action_config.fail_on_command_errors=false",
+    "--GITHUB_ACTION_CONFIG.FAIL_ON_COMMAND_ERRORS=false",
+    "--github_action_config__fail_on_command_errors=false",
+    '--github_action_config={"fail_on_command_errors": false}',
     # Resource, write, and regex controls stay host-controlled when commands are
     # supplied through comments, even when root repository settings may set them.
     "--pr_reviewer.max_number_of_calls=10",
-    "--pr_code_suggestions.parallel_calls=true",
+    "--pr_reviewer.enable_large_pr_chunking=true",
+    "--pr_description.max_ai_calls=50",
+    "--pr_description__max_ai_calls=50",
+    '--pr_description={"max_ai_calls": 50}',
+    "--pr_reviewer.per_commit_review=true",
+    "--pr_reviewer__per_commit_review=true",
+    '--pr_reviewer={"per_commit_review": true}',
+    "--pr_reviewer.max_commits_per_review=0",
     '--config.fallback_models=["gpt-4.1"]',
     "--config.num_retries=10",
     "--pr_update_changelog.push_changelog_changes=true",
@@ -156,6 +162,29 @@ FORBIDDEN_ARGS = [
     "--config.branch_issue_regex=^([\\w/.-]+)*!$",
     "--ignore.regex=^([\\w/.-]+)*!$",
     "--config.output_relevant_configurations=true",
+    # Model spend, provider metadata and process-wide LiteLLM logging stay host-controlled.
+    "--pr_similar_issue.max_issues_to_scan=100000",
+    "--pr_similar_issue__max_issues_to_scan=100000",
+    '--pr_similar_issue={"max_issues_to_scan": 100000}',
+    "--config.reasoning_effort=high",
+    "--config__reasoning_effort=high",
+    '--config={"reasoning_effort": "high"}',
+    "--openrouter.reasoning_effort=high",
+    "--openrouter__reasoning_effort=high",
+    '--openrouter={"reasoning_effort": "high"}',
+    "--openrouter.reasoning_max_tokens=100000",
+    "--openrouter__reasoning_max_tokens=100000",
+    '--openrouter={"reasoning_max_tokens": 100000}',
+    "--litellm.add_session_id_to_requests=true",
+    "--litellm__add_session_id_to_requests=true",
+    '--litellm={"add_session_id_to_requests": true}',
+    "--config.add_user_to_requests=true",
+    "--config__add_user_to_requests=true",
+    '--config={"add_user_to_requests": true}',
+    "--litellm.turn_off_message_logging=true",
+    "--LITELLM.TURN_OFF_MESSAGE_LOGGING=true",
+    "--litellm__turn_off_message_logging=true",
+    '--litellm={"turn_off_message_logging": true}',
     # section-level mapping values on sections that are not host-only themselves:
     # the dotted keys below are all rejected, so their {key: value} forms must be too
     '--qdrant={url: "https://evil.example", api_key: "x"}',
@@ -182,7 +211,6 @@ ALLOWED_ARGS_SINGLE = [
     "--pr_description.publish_labels=false",
     # a mapping value whose nested keys are all allowed stays accepted
     "--qdrant={timeout: 5, prefer_grpc: true}",
-    "--pr_similar_issue.max_issues_to_scan=50",
     "--github.publish_as_check_run=true",
     "--gitlab.handle_push_trigger=true",
     "--bitbucket.identity_request_timeout=10",
@@ -275,17 +303,17 @@ def test_validate_user_args_all_allowed_together():
 )
 async def test_handle_request_uses_real_validator_to_block_forbidden(monkeypatch, forbidden):
     """Integration test: forbidden CLI arg should be rejected by the real
-    CliArgs.validate_user_args, before any settings update, tool
-    instantiation, tool run, or notify call happens."""
+    CliArgs.validate_user_args, before any settings update, command
+    instantiation, command run, or notify call happens."""
 
     notify = Mock()
     update_settings = Mock()
-    tool_factory = Mock()
+    command_factory = Mock()
 
     monkeypatch.setattr(pr_agent_module, "enforce_request_policy", lambda _url: None)
     monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url: None)
     monkeypatch.setattr(pr_agent_module, "update_settings_from_args", update_settings)
-    monkeypatch.setitem(pr_agent_module.command2class, "custom", tool_factory)
+    monkeypatch.setitem(pr_agent_module.command2class, "custom", command_factory)
 
     handled = await pr_agent_module.PRAgent(ai_handler="fake-ai")._handle_request(
         "https://example/pr/1",
@@ -295,7 +323,7 @@ async def test_handle_request_uses_real_validator_to_block_forbidden(monkeypatch
 
     assert handled is False
     update_settings.assert_not_called()
-    tool_factory.assert_not_called()
+    command_factory.assert_not_called()
     notify.assert_not_called()
 
 
@@ -317,12 +345,12 @@ async def test_handle_request_rejects_forbidden_mapping_args_in_comment_and_cli(
     """A --section={key: value} arg is rejected for both comment and CLI request forms."""
     notify = Mock()
     update_settings = Mock()
-    tool_factory = Mock()
+    command_factory = Mock()
 
     monkeypatch.setattr(pr_agent_module, "enforce_request_policy", lambda _url: None)
     monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url: None)
     monkeypatch.setattr(pr_agent_module, "update_settings_from_args", update_settings)
-    monkeypatch.setitem(pr_agent_module.command2class, "custom", tool_factory)
+    monkeypatch.setitem(pr_agent_module.command2class, "custom", command_factory)
 
     handled = await pr_agent_module.PRAgent(ai_handler="fake-ai")._handle_request(
         "https://example/pr/1", command_request, notify
@@ -330,7 +358,7 @@ async def test_handle_request_rejects_forbidden_mapping_args_in_comment_and_cli(
 
     assert handled is False
     update_settings.assert_not_called()
-    tool_factory.assert_not_called()
+    command_factory.assert_not_called()
     notify.assert_not_called()
 
 
@@ -353,13 +381,13 @@ async def test_handle_request_rejects_mapping_args_as_the_settings_loader_parses
     rejected argument leaves the settings untouched."""
     notify = Mock()
     update_settings = Mock(wraps=pr_agent_module.update_settings_from_args)
-    tool_factory = Mock()
+    command_factory = Mock()
     qdrant_url_before = pr_agent_module.get_settings().get("qdrant.url")
 
     monkeypatch.setattr(pr_agent_module, "enforce_request_policy", lambda _url: None)
     monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url: None)
     monkeypatch.setattr(pr_agent_module, "update_settings_from_args", update_settings)
-    monkeypatch.setitem(pr_agent_module.command2class, "custom", tool_factory)
+    monkeypatch.setitem(pr_agent_module.command2class, "custom", command_factory)
 
     handled = await pr_agent_module.PRAgent(ai_handler="fake-ai")._handle_request(
         "https://example/pr/1", command_request, notify
@@ -368,7 +396,7 @@ async def test_handle_request_rejects_mapping_args_as_the_settings_loader_parses
     assert handled is False
     update_settings.assert_not_called()
     assert pr_agent_module.get_settings().get("qdrant.url") == qdrant_url_before
-    tool_factory.assert_not_called()
+    command_factory.assert_not_called()
     notify.assert_not_called()
 
 
@@ -384,15 +412,15 @@ async def test_handle_request_allows_protected_key_names_in_setting_values(monke
     """Validate setting keys while retaining original values for direct string and list requests."""
     expected_args = ["--pr_reviewer.extra_instructions=Flag any hardcoded openai.key in the diff"]
     update_settings = Mock(side_effect=lambda args: args)
-    tool = Mock()
-    tool.run = AsyncMock()
-    tool_factory = Mock(return_value=tool)
+    command = Mock()
+    command.run = AsyncMock()
+    command_factory = Mock(return_value=command)
     notify = Mock()
 
     monkeypatch.setattr(pr_agent_module, "enforce_request_policy", lambda _url: None)
     monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda _pr_url: None)
     monkeypatch.setattr(pr_agent_module, "update_settings_from_args", update_settings)
-    monkeypatch.setitem(pr_agent_module.command2class, "custom", tool_factory)
+    monkeypatch.setitem(pr_agent_module.command2class, "custom", command_factory)
 
     handled = await pr_agent_module.PRAgent(ai_handler="fake-ai")._handle_request(
         "https://example/pr/1", command_request, notify
@@ -400,8 +428,8 @@ async def test_handle_request_allows_protected_key_names_in_setting_values(monke
 
     assert handled is True
     update_settings.assert_called_once_with(expected_args)
-    tool_factory.assert_called_once_with("https://example/pr/1", ai_handler="fake-ai", args=expected_args)
-    tool.run.assert_awaited_once_with()
+    command_factory.assert_called_once_with("https://example/pr/1", ai_handler="fake-ai", args=expected_args)
+    command.run.assert_awaited_once_with()
     notify.assert_called_once_with()
 
 
@@ -427,7 +455,6 @@ def test_validate_user_args_rejects_forbidden_arg_with_leading_whitespace(prefix
         "--github .seconds_between_writes=1",
         "--github.\tapi_retries=3",
         "--pr_reviewer. max_number_of_calls=10",
-        "--pr_code_suggestions .parallel_calls=true",
         "--pr_similar_issue .force_update_dataset=true",
         "--prompt_fragments .diff_hunk_format=unsafe",
         "--push_outputs. webhook_url=https://evil.example",
@@ -471,7 +498,6 @@ def test_validate_user_args_rejects_forbidden_key_with_whitespace_around_the_sec
         "--pr_description .extra_instructions=hi",
         "--pr_description	.extra_instructions=hi",
         "--config .verbosity_level=2",
-        "--pr_code_suggestions. suggestions_score_threshold=0",
         # the whitespace check runs before the mapping branch: a mapping-valued flag
         # `continue`s past the rest of the loop body in validate_user_args
         "--pr_description .extra_instructions={what: parse}",

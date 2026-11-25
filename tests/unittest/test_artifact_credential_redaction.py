@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import pr_agent.algo.artifacts as artifacts
+from pr_agent.algo import artifacts
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.git_provider import redact_credentials
 from tests.unittest._settings_helpers import restore_settings, snapshot_settings
@@ -359,8 +359,8 @@ def test_injected_artifacts_retain_redacted_context_after_settings_change(tmp_pa
     try:
         artifacts.inject_artifact_context()
         monkeypatch.setattr(artifacts, "_read_and_truncate", MagicMock(side_effect=AssertionError("Unexpected reread")))
-        for tool in ("pr_reviewer", "pr_description", "pr_code_suggestions"):
-            context = artifacts.get_artifact_context(tool)["content"]
+        for command in ("pr_reviewer", "pr_description", "pr_code_suggestions"):
+            context = artifacts.get_artifact_context(command)["content"]
             assert "synthetic-bearer-value" not in context
             assert "sk-proj-synthetic-value" not in context
             assert "FAILED test_boundary" in context

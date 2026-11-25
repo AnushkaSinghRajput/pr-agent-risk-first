@@ -1,4 +1,3 @@
-import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,7 +17,6 @@ from requests.exceptions import RequestException
 from pr_agent.algo.comment_identity import PRCodeSuggestionsIdentity, PRReviewHeader, PRReviewIdentity
 from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
 from pr_agent.git_providers.git_provider import (
-    DEFAULT_DISCUSSION_CONTEXT_CHARS,
     ConcurrentFileUpdateError,
     FileContentSnapshot,
     IncrementalPR,
@@ -76,10 +74,43 @@ def _thread(notes, discussion_id='d1'):
     return discussion
 
 
+@pytest.mark.parametrize(("origin_note_id", "expected"), [
+    (None, []),
+    (102, [(101, "reviewer", "Earlier context")]),
+    (999, []),
+])
+def test_line_question_history_reads_only_selected_gitlab_discussion(origin_note_id, expected):
+    provider = GitLabProvider.__new__(GitLabProvider)
+    provider.mr = MagicMock()
+    provider.mr.discussions.get.return_value = _thread([
+        {"id": 101, "body": "Earlier context", "author": {"username": "reviewer"}},
+        {"id": 102, "body": "/ask why?", "author": {"username": "alice"}},
+        {"id": 103, "body": "System note", "system": True},
+        {"id": 104, "body": "  "},
+        {"id": 105, "body": "Anonymous reply", "author": None},
+    ])
+
+    assert provider.supports_line_question_history() is True
+    with (patch("pr_agent.git_providers.gitlab_provider.get_settings") as settings,
+          patch("pr_agent.git_providers.gitlab_provider.get_logger") as logger):
+        settings.return_value.get.return_value = origin_note_id
+        comments = provider.get_review_thread_comments("discussion-1")
+
+    if origin_note_id is None:
+        provider.mr.discussions.get.assert_not_called()
+    else:
+        provider.mr.discussions.get.assert_called_once_with("discussion-1")
+    if origin_note_id == 999:
+        logger.return_value.warning.assert_called_once()
+    else:
+        logger.return_value.warning.assert_not_called()
+    assert [(comment.id, comment.user.login, comment.body) for comment in comments] == expected
+
+
 @pytest.mark.parametrize(("text", "expected"), [
     (
         "Ping @user, email x@y.com, package /package/@scope/pkg, and (@group).",
-        "Ping @\u200buser, email x@y.com, package /package/@scope/pkg, and (@\u200bgroup).",
+        "Ping @\u200buser, email x@y.com, package /package/@\u200bscope/pkg, and (@\u200bgroup).",
     ),
     (
         "Inline `@literal` and fenced:\n```text\n@literal\n```\n@active",
@@ -103,6 +134,55 @@ def _thread(notes, discussion_id='d1'):
     ),
 ])
 def test_neutralize_gitlab_mentions_preserves_literals(text, expected):
+    assert _neutralize_gitlab_mentions(text) == expected
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("café@user", "café@\u200buser"),
+    ("Тест@user", "Тест@\u200buser"),
+    ("packages/@scope/pkg", "packages/@\u200bscope/pkg"),
+    ("cc &#64;user", "cc &#64;\u200buser"),
+    ("cc &#0064;user", "cc &#0064;\u200buser"),
+    ("cc &#x40;user and &#X0040;team", "cc &#x40;\u200buser and &#X0040;\u200bteam"),
+    ("cc &commat;user", "cc &commat;\u200buser"),
+    ("cc é&#64;user", "cc é&#64;\u200buser"),
+    ("cc @&#111;ctocat", "cc @\u200b&#111;ctocat"),
+])
+def test_neutralize_gitlab_mentions_uses_gitlab_reference_boundaries(text, expected):
+    assert _neutralize_gitlab_mentions(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "email x@y.com and first.last_1@example.org",
+    "entity in a word a&#64;b.com",
+    "unknown entities &#640;user &#x400;user &at;user &#64user",
+    "see https://medium.com/@user/post and <https://example.com/@team>",
+    "gitlab autolinks any scheme custom://host/@user",
+    "mentions inside code `&#64;user` and `/@scope/pkg`",
+    "already neutralised @\u200buser and &#64;\u200buser",
+])
+def test_neutralize_gitlab_mentions_leaves_non_mentions_unchanged(text):
+    assert _neutralize_gitlab_mentions(text) == text
+
+
+def test_neutralize_gitlab_mentions_resumes_after_an_autolinked_url():
+    text = "see https://medium.com/@user then @reviewer"
+    expected = "see https://medium.com/@user then @\u200breviewer"
+
+    assert _neutralize_gitlab_mentions(text) == expected
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("[docs](https://example.com)@reviewer", "[docs](https://example.com)@\u200breviewer"),
+    ("`https://example.com`/@user", "`https://example.com`/@\u200buser"),
+    ("[https://example.com]@user", "[https://example.com]@\u200buser"),
+    ("\"https://example.com\"@user", "\"https://example.com\"@\u200buser"),
+    ("**https://x.com**@all", "**https://x.com**@\u200ball"),
+    ("~~https://x.com~~@all", "~~https://x.com~~@\u200ball"),
+    ("|https://x.com|@all|", "|https://x.com|@\u200ball|"),
+    ("https://x.com\\@all", "https://x.com\\@\u200ball"),
+])
+def test_neutralize_gitlab_mentions_ends_a_url_at_markdown_delimiters(text, expected):
     assert _neutralize_gitlab_mentions(text) == expected
 
 
@@ -159,6 +239,88 @@ def test_neutralize_gitlab_mentions_leaves_indented_code_inside_a_list():
     assert _neutralize_gitlab_mentions(text) == expected
 
 
+@pytest.mark.parametrize(("text", "expected"), [
+    (
+        "Note the ` here\n===\n@all about `x`",
+        "Note the ` here\n===\n@\u200ball about `x`",
+    ),
+    (
+        "Note the ` here\n---\n@all about `x`",
+        "Note the ` here\n---\n@\u200ball about `x`",
+    ),
+    (
+        "Note the ` here\n***\n@all about `x`",
+        "Note the ` here\n***\n@\u200ball about `x`",
+    ),
+    (
+        "### Note the ` here\n@all about `x`",
+        "### Note the ` here\n@\u200ball about `x`",
+    ),
+    (
+        "Note the ` here\n<details><summary>More</summary>\n@all about `x`",
+        "Note the ` here\n<details><summary>More</summary>\n@\u200ball about `x`",
+    ),
+    (
+        "<!-- a ` here -->\n@all about `x`",
+        "<!-- a ` here -->\n@\u200ball about `x`",
+    ),
+    (
+        "<pre>\n```\n@all\n</pre>\n@reviewer",
+        "<pre>\n```\n@\u200ball\n</pre>\n@\u200breviewer",
+    ),
+    (
+        "a ` stray\n<div>`@all`</div>",
+        "a ` stray\n<div>`@\u200ball`</div>",
+    ),
+    (
+        "<details>\n`@all`\n\n`@literal`",
+        "<details>\n`@\u200ball`\n\n`@literal`",
+    ),
+])
+def test_neutralize_gitlab_mentions_stops_a_code_span_at_a_heading_break_or_html_block(text, expected):
+    assert _neutralize_gitlab_mentions(text) == expected
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("Escaped \\` tick, @all and `x`", "Escaped \\` tick, @\u200ball and `x`"),
+    ("Escaped \\``` @literal`` and @all", "Escaped \\``` @literal`` and @\u200ball"),
+    ("Escaped backslash \\\\` @literal `x`", "Escaped backslash \\\\` @literal `x`"),
+    ("Inside `a\\` @all `x`", "Inside `a\\` @\u200ball `x`"),
+])
+def test_neutralize_gitlab_mentions_handles_escaped_backticks(text, expected):
+    assert _neutralize_gitlab_mentions(text) == expected
+
+
+def test_neutralize_gitlab_mentions_ignores_a_backtick_fence_with_a_backtick_in_its_info():
+    text = "```a`b\n@all\n"
+    expected = "```a`b\n@\u200ball\n"
+
+    assert _neutralize_gitlab_mentions(text) == expected
+
+
+def test_neutralize_gitlab_mentions_does_not_close_a_fence_on_a_line_with_an_info_string():
+    text = "```\n@first\n```js\n@second\n```\n@active"
+    expected = "```\n@first\n```js\n@second\n```\n@\u200bactive"
+
+    assert _neutralize_gitlab_mentions(text) == expected
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("cc _@all_ please", "cc _@\u200ball_ please"),
+    ("cc __@all__ please", "cc __@\u200ball__ please"),
+    ("snake_@case stays", "snake_@case stays"),
+    ("@_@all", "@\u200b_@\u200ball"),
+])
+def test_neutralize_gitlab_mentions_handles_underscore_emphasis(text, expected):
+    assert _neutralize_gitlab_mentions(text) == expected
+
+
+def test_neutralize_gitlab_mentions_handles_many_escaped_ticks_and_underscores():
+    text = "\\` " * 20000 + "_" * 20000 + "@active"
+
+    assert _neutralize_gitlab_mentions(text).endswith("_@\u200bactive")
+
+
 class TestGitLabProvider:
     """Test suite for GitLab provider functionality."""
 
@@ -198,6 +360,30 @@ class TestGitLabProvider:
 
             mock_gitlab_client.http_get.side_effect = _current_mr_metadata
             return provider
+
+    @pytest.mark.parametrize(
+        ("recommendation", "state"),
+        [
+            ("no_concerns_found", "success"),
+            ("needs_review", "skipped"),
+            ("changes_required", "failed"),
+        ],
+    )
+    def test_publish_merge_recommendation_status_on_reviewed_commit(
+        self, gitlab_provider, recommendation, state
+    ):
+        gitlab_provider.mr.diff_refs = {"head_sha": "reviewed-head"}
+        gitlab_provider.mr.source_project_id = 741
+
+        assert gitlab_provider.publish_merge_recommendation_status(recommendation) is True
+
+        gitlab_provider.gl.projects.get.assert_called_with(741, lazy=True)
+        commit = gitlab_provider.gl.projects.get.return_value.commits.get.return_value
+        commit.statuses.create.assert_called_once_with({
+            "state": state,
+            "name": "PR Agent - Review",
+            "description": f"Computed merge recommendation: {recommendation}",
+        })
 
     def test_get_commit_messages_reads_all_commits_with_larger_pages(self, gitlab_provider):
         client = Gitlab("https://gitlab.example.com", private_token="test-token")
@@ -243,6 +429,50 @@ class TestGitLabProvider:
         gitlab_provider.reset_diff_cache_for_command()
         assert gitlab_provider.get_latest_commit_url() == next_url
         assert client.http_request.call_count == 2
+
+    def test_latest_commit_url_reuses_commit_messages_fetch_until_reset(self, gitlab_provider):
+        client = Gitlab("https://gitlab.example.com", private_token="test-token")
+        gitlab_provider.mr = client.projects.get("target/repo", lazy=True).mergerequests.get(1, lazy=True)
+        latest_url = "https://gitlab.example.com/fork/repo/-/commit/newest"
+        older_url = "https://gitlab.example.com/fork/repo/-/commit/older"
+        response = MagicMock()
+        response.json.return_value = [
+            {"id": "newest", "message": "Newest commit", "web_url": latest_url},
+            {"id": "older", "message": "Older commit", "web_url": older_url},
+        ]
+        response.links = {}
+        response.headers = {}
+        client.http_request = MagicMock(return_value=response)
+
+        with patch("pr_agent.git_providers.gitlab_provider.get_settings") as mock_settings:
+            mock_settings.return_value.get.return_value = None
+            messages = gitlab_provider.get_commit_messages()
+
+        assert messages == "1. Newest commit\n2. Older commit"
+        assert gitlab_provider.get_latest_commit_url() == latest_url
+        client.http_request.assert_called_once()
+
+        next_url = "https://gitlab.example.com/fork/repo/-/commit/pushed"
+        response.json.return_value = [{"id": "pushed", "message": "Pushed", "web_url": next_url}]
+        gitlab_provider.reset_diff_cache_for_command()
+        assert gitlab_provider.get_latest_commit_url() == next_url
+        assert client.http_request.call_count == 2
+
+    def test_latest_commit_url_reuses_pr_commits_fetch(self, gitlab_provider):
+        gitlab_provider.mr.commits.return_value = [
+            SimpleNamespace(
+                id="new", message="new", web_url="https://gitlab.com/test/repo/-/commit/new", parent_ids=["old"]
+            ),
+            SimpleNamespace(
+                id="old", message="old", web_url="https://gitlab.com/test/repo/-/commit/old", parent_ids=[]
+            ),
+        ]
+
+        commits = gitlab_provider.get_pr_commits()
+
+        assert [c.sha for c in commits] == ["old", "new"]
+        assert gitlab_provider.get_latest_commit_url() == "https://gitlab.com/test/repo/-/commit/new"
+        gitlab_provider.mr.commits.assert_called_once_with(per_page=100)
 
     @pytest.mark.parametrize("first_result,expected", [
         (StopIteration(), ""),
@@ -1025,6 +1255,63 @@ class TestGitLabProvider:
             "src/lib_a", "src/lib_b", "src/lib_a/src/a.c", "src/lib_b/src/a.c",
         ]
 
+    def test_expanded_submodule_files_link_into_the_submodule_project(self, gitlab_provider):
+        gitlab_provider.gl.url = "https://gitlab.com"
+        gitlab_provider.id_project = "group/repo"
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.mr.source_branch = "feature/cache"
+        settings = MagicMock()
+        settings.get.side_effect = lambda key, default=None: {"GITLAB.EXPAND_SUBMODULE_DIFFS": True}.get(key, default)
+        sub_diffs = [
+            {"old_path": "inc/a b.h", "new_path": "inc/a b.h", "diff": "@@ -1 +1 @@\n-x\n+y\n"},
+            {"old_path": "gone.c", "new_path": "gone.c", "diff": "@@ -1 +0,0 @@\n-x\n", "deleted_file": True},
+        ]
+
+        with patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=settings), \
+             patch.object(gitlab_provider, "_get_gitmodules_map",
+                          return_value={"src/lib_a": "../../libs/lib_a.git", "src/lib_b": "../../libs/lib_b.git"}), \
+             patch.object(gitlab_provider, "_compare_submodule", side_effect=[sub_diffs, []]):
+            gitlab_provider._expand_submodule_changes([self._submodule_bump(), self._submodule_bump("src/lib_b")])
+
+        lib_a = "https://gitlab.com/libs/lib_a"
+        assert gitlab_provider.get_line_link("src/lib_a/inc/a b.h", -1) == f"{lib_a}/-/blob/bbb2222/inc/a%20b.h"
+        assert gitlab_provider.get_line_link("src/lib_a/inc/a b.h", 10, 12) == (
+            f"{lib_a}/-/blob/bbb2222/inc/a%20b.h#L10-12"
+        )
+        assert gitlab_provider.get_line_link("src/lib_a/gone.c", -1) == f"{lib_a}/-/blob/aaa1111/gone.c"
+        assert gitlab_provider.get_line_link("src/lib_a", -1) == f"{lib_a}/-/compare/aaa1111...bbb2222"
+        # A bump that could not be expanded keeps its link into the reviewed project.
+        assert gitlab_provider.get_line_link("src/lib_b", -1) == (
+            "https://gitlab.com/group/repo/-/blob/feature/cache/src/lib_b?ref_type=heads"
+        )
+
+    def test_expanded_submodule_links_use_the_resolved_project_web_url(self, gitlab_provider):
+        gitlab_provider.gl.url = "https://gitlab-api.internal"
+        gitlab_provider.id_project = "group/repo"
+        settings = MagicMock()
+        settings.get.side_effect = lambda key, default=None: {"GITLAB.EXPAND_SUBMODULE_DIFFS": True}.get(key, default)
+        project = MagicMock()
+        project.web_url = "https://gitlab.example.com/libs/lib_a/"
+        project.repository_compare.return_value = {
+            "diffs": [{"old_path": "src/a.c", "new_path": "src/a.c", "diff": "@@ -1 +1 @@\n-x\n+y\n"}]
+        }
+
+        with patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=settings), \
+             patch.object(gitlab_provider, "_get_gitmodules_map", return_value={"src/lib_a": "../../libs/lib_a.git"}), \
+             patch.object(gitlab_provider, "_project_by_path", return_value=project) as m_project, \
+             patch.object(gitlab_provider, "_submodule_target_allowed", return_value=True):
+            gitlab_provider._expand_submodule_changes([self._submodule_bump()])
+            # The second pass is served from the compare cache and must not resolve the project again.
+            gitlab_provider._expand_submodule_changes([self._submodule_bump()])
+
+        m_project.assert_called_once_with("libs/lib_a")
+        assert gitlab_provider.get_line_link("src/lib_a/src/a.c", -1) == (
+            "https://gitlab.example.com/libs/lib_a/-/blob/bbb2222/src/a.c"
+        )
+        assert gitlab_provider.get_line_link("src/lib_a", -1) == (
+            "https://gitlab.example.com/libs/lib_a/-/compare/aaa1111...bbb2222"
+        )
+
     def test_expand_submodule_changes_skips_unresolvable_relative_url(self, gitlab_provider):
         gitlab_provider.id_project = "group/repo"
         settings = MagicMock()
@@ -1326,6 +1613,52 @@ class TestGitLabProvider:
         with pytest.raises(RuntimeError, match="permission denied"):
             gitlab_provider.publish_description("AI title", "Updated description")
 
+    def test_publish_description_caps_a_title_over_the_api_limit(self, gitlab_provider):
+        # GitLab rejects a title longer than 255 characters (HTTP 400). An
+        # overlong AI title would fail the whole /describe publish, including
+        # a body that already fits.
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.id_mr = 1
+        title = "A" * 300
+        body = "### **Description**\n- Short change\n"
+
+        gitlab_provider.publish_description(title, body)
+
+        published_title = gitlab_provider.mr.title
+        assert len(published_title) == 255
+        assert published_title.endswith("...")
+        assert published_title.startswith("A")
+        assert gitlab_provider.mr.description == body
+        gitlab_provider.mr.save.assert_called_once()
+
+    def test_publish_description_keeps_a_title_within_the_limit(self, gitlab_provider):
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.id_mr = 1
+        title = "A" * 255
+
+        gitlab_provider.publish_description(title, "short")
+
+        assert gitlab_provider.mr.title == title
+        assert gitlab_provider.mr.description == "short"
+        gitlab_provider.mr.save.assert_called_once()
+
+    def test_publish_description_caps_a_title_grown_by_mention_neutralization(self, gitlab_provider):
+        # Neutralization inserts a zero-width space after @, so a 255-character
+        # title can go over the API limit only after that rewrite.
+        gitlab_provider.mr = MagicMock()
+        gitlab_provider.id_mr = 1
+        title = "A" * 245 + " @reviewer"
+        assert len(title) == 255
+
+        gitlab_provider.publish_description(title, "short")
+
+        published_title = gitlab_provider.mr.title
+        assert "\u200b" in published_title
+        assert len(published_title) == 255
+        assert published_title.endswith("...")
+        assert gitlab_provider.mr.description == "short"
+        gitlab_provider.mr.save.assert_called_once()
+
     @pytest.mark.parametrize("configured", [True, False])
     def test_should_publish_review_as_thread_reflects_config(self, gitlab_provider, configured):
         with patch("pr_agent.git_providers.gitlab_provider.get_settings",
@@ -1360,18 +1693,13 @@ class TestGitLabProvider:
         with patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=settings):
             assert gitlab_provider.should_reply_to_trigger_comment() is configured
 
-    @pytest.mark.parametrize(
-        ("method_name", "setting_name"),
-        [
-            ("should_publish_improve_as_thread", "GITLAB.PUBLISH_IMPROVE_AS_THREAD"),
-            ("should_reply_to_trigger_comment", "GITLAB.REPLY_TO_TRIGGER_COMMENT"),
-        ],
-    )
-    def test_string_false_disables_gitlab_flags(self, gitlab_provider, method_name, setting_name):
+    def test_string_false_disables_gitlab_flags(self, gitlab_provider):
         settings = MagicMock()
-        settings.get.side_effect = lambda key, default=None: {setting_name: "false"}.get(key, default)
+        settings.get.side_effect = lambda key, default=None: {
+            "GITLAB.REPLY_TO_TRIGGER_COMMENT": "false",
+        }.get(key, default)
         with patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=settings):
-            assert getattr(gitlab_provider, method_name)() is False
+            assert gitlab_provider.should_reply_to_trigger_comment() is False
 
     def test_string_false_does_not_expand_submodule_changes(self, gitlab_provider):
         settings = MagicMock()
@@ -1439,7 +1767,7 @@ class TestGitLabProvider:
     def test_inline_fallback_note_neutralizes_mentions(self, gitlab_provider, as_draft):
         gitlab_provider.mr = MagicMock()
         create = gitlab_provider.mr.draft_notes.create if as_draft else gitlab_provider.mr.discussions.create
-        create.side_effect = GitlabCreateError("position rejected")
+        create.side_effect = GitlabCreateError("position rejected", response_code=400)
         gitlab_provider.get_relevant_diff = MagicMock(return_value=SimpleNamespace(
             base_commit_sha="base", start_commit_sha="start", head_commit_sha="head"
         ))
@@ -1929,205 +2257,6 @@ class TestGitLabProvider:
         assert client.http_request.call_count == 2
         client.http_put.assert_not_called()
 
-    def test_get_code_suggestion_thread_context_includes_bot_suggestion_threads(self, gitlab_provider):
-        gitlab_provider._own_user_id = _BOT_USER_ID
-        open_thread = _thread([
-            _thread_note(body=_AGENT_BODY + "\n<!-- pr-agent-dedup: aabbccddeeff -->"),
-        ], discussion_id='open-thread')
-        human_resolved = _thread([
-            _thread_note(resolved=True, resolved_by={'id': 99, 'name': 'Alice'}),
-        ], discussion_id='human-resolved')
-        bot_resolved = _thread([
-            _thread_note(resolved=True, resolved_by={'id': _BOT_USER_ID, 'name': 'GitLab Bot'}),
-            {'author': {'id': 99, 'name': 'Alice'}, 'system': False, 'body': 'We will not do this.'},
-        ], discussion_id='bot-resolved')
-        general = _thread([_thread_note(body=_HUMAN_BODY)], discussion_id='general')
-
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.return_value = [open_thread, general, human_resolved, bot_resolved]
-
-        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
-
-        assert discussions == [
-            {
-                "thread_id": "bot-resolved",
-                "status": "auto_resolved",
-                "file": "src/app.py",
-                "start_line": 12,
-                "end_line": 12,
-                "suggestion": _AGENT_BODY,
-                "replies": [{"author": "Alice", "message": "We will not do this."}],
-            },
-            {
-                "thread_id": "human-resolved",
-                "status": "resolved",
-                "file": "src/app.py",
-                "start_line": 12,
-                "end_line": 12,
-                "suggestion": _AGENT_BODY,
-                "replies": [],
-            },
-            {
-                "thread_id": "open-thread",
-                "status": "open",
-                "file": "src/app.py",
-                "start_line": 12,
-                "end_line": 12,
-                "suggestion": _AGENT_BODY,
-                "replies": [],
-            },
-        ]
-
-    def test_get_code_suggestion_thread_context_reports_applied_suggestions(self, gitlab_provider):
-        gitlab_provider._own_user_id = _BOT_USER_ID
-        applied = _thread_note(resolved=True, resolved_by={'id': _BOT_USER_ID, 'name': 'GitLab Bot'})
-        applied['suggestions'] = [{'id': 1, 'applied': True}]
-        not_applied = _thread_note()
-        not_applied['suggestions'] = [{'id': 2, 'applied': False}]
-
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.return_value = [
-            _thread([applied], discussion_id='applied'),
-            _thread([not_applied], discussion_id='pending'),
-        ]
-
-        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
-
-        assert [(d["thread_id"], d["status"]) for d in discussions] == [("pending", "open"), ("applied", "applied")]
-
-    def test_get_code_suggestion_thread_context_treats_bot_resolution_as_resolved_when_identity_is_unknown(
-            self, gitlab_provider):
-        gitlab_provider._own_user_id = None
-        note = _thread_note(resolved=True, resolved_by={'id': _BOT_USER_ID, 'name': 'GitLab Bot'})
-
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.return_value = [_thread([note], discussion_id='d1')]
-
-        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
-
-        assert discussions[0]["status"] == "resolved"
-
-    def test_get_code_suggestion_thread_context_uses_the_multi_line_range(self, gitlab_provider):
-        gitlab_provider._own_user_id = _BOT_USER_ID
-        note = _thread_note()
-        note['position']['line_range'] = {
-            'start': {'new_line': 10, 'old_line': None},
-            'end': {'new_line': 14, 'old_line': None},
-        }
-        deletion = _thread_note(line_key='old_line')
-        deletion['position']['line_range'] = {
-            'start': {'new_line': None, 'old_line': 3},
-            'end': {'new_line': None, 'old_line': 5},
-        }
-        renamed = _thread_note(line_key=None)
-        renamed['position'].update({'old_path': 'src/old_name.py', 'new_path': 'src/new_name.py'})
-        renamed['position']['line_range'] = {
-            'start': {'new_line': 7, 'old_line': None},
-            'end': {'new_line': 8, 'old_line': None},
-        }
-
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.return_value = [
-            _thread([note], discussion_id='range'),
-            _thread([deletion], discussion_id='deleted'),
-            _thread([renamed], discussion_id='renamed'),
-        ]
-
-        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
-
-        assert [(d["thread_id"], d["file"], d["start_line"], d["end_line"]) for d in discussions] == [
-            ("renamed", "src/new_name.py", 7, 8),
-            ("deleted", "src/app.py", 3, 5),
-            ("range", "src/app.py", 10, 14),
-        ]
-
-    def test_get_code_suggestion_thread_context_truncates_messages_and_replies(self, gitlab_provider):
-        gitlab_provider._own_user_id = _BOT_USER_ID
-        long_message = _AGENT_BODY + "\n" + "x" * 900
-        long_reply = "y" * 900
-        reply = {'author': {'id': 99, 'name': 'Alice'}, 'system': False, 'body': long_reply}
-        thread = _thread([_thread_note(body=long_message), reply], discussion_id='d1')
-
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.return_value = [thread]
-
-        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
-
-        assert len(discussions[0]["suggestion"]) == 750
-        assert discussions[0]["replies"] == [{"author": "Alice", "message": long_reply[:750]}]
-
-    def test_get_code_suggestion_thread_context_caps_thread_count(self, gitlab_provider):
-        gitlab_provider._own_user_id = _BOT_USER_ID
-        threads = [_thread([_thread_note()], discussion_id=f'd{i}') for i in range(60)]
-
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.return_value = threads
-
-        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
-
-        assert len(discussions) == 50
-
-    def test_get_code_suggestion_thread_context_enforces_context_char_budget(self, gitlab_provider):
-        gitlab_provider._own_user_id = _BOT_USER_ID
-        big_message = "**Suggestion:** " + "x" * 740
-        threads = [_thread([_thread_note(body=big_message)], discussion_id=f'd{i}') for i in range(60)]
-
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.return_value = threads
-
-        result = gitlab_provider.get_code_suggestion_thread_context()
-
-        assert len(result) <= DEFAULT_DISCUSSION_CONTEXT_CHARS
-        assert len(json.loads(result)) < 60
-
-    def test_get_code_suggestion_thread_context_caps_replies_after_dropping_system_notes(self, gitlab_provider):
-        gitlab_provider._own_user_id = _BOT_USER_ID
-        human_replies = [{'author': {'id': 99, 'name': 'Alice'}, 'system': False, 'body': f'reply {i}'}
-                         for i in range(12)]
-        system_notes = [{'author': {'id': 99, 'name': 'Alice'}, 'system': True, 'body': 'changed this line'}
-                        for _ in range(5)]
-        thread = _thread([_thread_note(), *human_replies, *system_notes], discussion_id='d1')
-
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.return_value = [thread]
-
-        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
-
-        assert [reply["message"] for reply in discussions[0]["replies"]] == [f"reply {i}" for i in range(2, 12)]
-
-    def test_get_code_suggestion_thread_context_skips_threads_opened_by_a_human(self, gitlab_provider):
-        gitlab_provider._own_user_id = _BOT_USER_ID
-        human_thread = _thread([_thread_note(author_id=99)], discussion_id='human')
-        bot_thread = _thread([_thread_note()], discussion_id='bot')
-
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.return_value = [bot_thread, human_thread]
-
-        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
-
-        assert [discussion["thread_id"] for discussion in discussions] == ["bot"]
-
-    def test_get_code_suggestion_thread_context_keeps_threads_when_author_is_unverifiable(self, gitlab_provider):
-        gitlab_provider._own_user_id = None
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.return_value = [_thread([_thread_note()], discussion_id='d1')]
-
-        discussions = json.loads(gitlab_provider.get_code_suggestion_thread_context())
-
-        assert [discussion["thread_id"] for discussion in discussions] == ["d1"]
-
-    def test_get_code_suggestion_thread_context_empty_without_agent_threads(self, gitlab_provider):
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.return_value = [_thread([_thread_note(body=_HUMAN_BODY)])]
-
-        assert gitlab_provider.get_code_suggestion_thread_context() == ""
-
-    def test_get_code_suggestion_thread_context_soft_fails(self, gitlab_provider):
-        gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.discussions.list.side_effect = GitlabError("gitlab api error")
-
-        assert gitlab_provider.get_code_suggestion_thread_context() == ""
-
     def test_resolve_comment_thread_ignores_unrelated_discussions(self, gitlab_provider):
         # An open discussion that does not own our note must be left untouched.
         other = MagicMock()
@@ -2150,8 +2279,11 @@ class TestGitLabProvider:
                                   current_head_sha=_CURRENT_HEAD_SHA):
         gitlab_provider._own_user_id = own_user_id
         gitlab_provider.mr = MagicMock()
-        gitlab_provider.mr.diff_refs = {'head_sha': current_head_sha}
+        gitlab_provider.mr.diff_refs = {'head_sha': current_head_sha, 'start_sha': 'target-start'}
         gitlab_provider.mr.discussions.list.return_value = threads
+        gitlab_provider._get_merge_request = MagicMock(
+            side_effect=lambda: SimpleNamespace(diff_refs=dict(gitlab_provider.mr.diff_refs))
+        )
 
     def _run_outdated_cleanup(self, gitlab_provider, enabled=True):
         with patch("pr_agent.git_providers.gitlab_provider.get_settings",
@@ -2164,6 +2296,21 @@ class TestGitLabProvider:
 
         self._run_outdated_cleanup(gitlab_provider, enabled=False)
 
+        gitlab_provider.mr.discussions.list.assert_not_called()
+        outdated.save.assert_not_called()
+
+    @pytest.mark.parametrize("configured", ["false", "FALSE", "0"])
+    def test_string_false_does_not_resolve_outdated_inline_threads(self, gitlab_provider, configured):
+        # Env/TOML often delivers "false" as a string. Truthiness would enable
+        # the opt-in cleanup; parse it the same way as the other GitLab flags.
+        outdated = _thread([_thread_note()])
+        self._prepare_outdated_cleanup(gitlab_provider, [outdated])
+        settings = MagicMock()
+        settings.get.side_effect = lambda key, default=None: {
+            "GITLAB.RESOLVE_OUTDATED_INLINE_THREADS": configured,
+        }.get(key, default)
+        with patch("pr_agent.git_providers.gitlab_provider.get_settings", return_value=settings):
+            gitlab_provider.resolve_outdated_inline_threads()
         gitlab_provider.mr.discussions.list.assert_not_called()
         outdated.save.assert_not_called()
 
@@ -2252,6 +2399,27 @@ class TestGitLabProvider:
         self._run_outdated_cleanup(gitlab_provider)
 
         outdated.save.assert_called_once()
+
+    def test_outdated_cleanup_does_not_resolve_after_head_changes_during_scan(self, gitlab_provider):
+        outdated = _thread([_thread_note()])
+        self._prepare_outdated_cleanup(gitlab_provider, [outdated])
+        gitlab_provider._get_merge_request = MagicMock(
+            return_value=SimpleNamespace(diff_refs={'head_sha': _OUTDATED_HEAD_SHA})
+        )
+
+        self._run_outdated_cleanup(gitlab_provider)
+
+        outdated.save.assert_not_called()
+
+    def test_outdated_cleanup_rejects_target_update_without_head_change(self, gitlab_provider):
+        outdated = _thread([_thread_note()])
+        self._prepare_outdated_cleanup(gitlab_provider, [outdated])
+        gitlab_provider._get_merge_request = MagicMock(return_value=SimpleNamespace(
+            diff_refs={'head_sha': _CURRENT_HEAD_SHA, 'start_sha': 'new-target'}
+        ))
+
+        self._run_outdated_cleanup(gitlab_provider)
+        outdated.save.assert_not_called()
 
     def test_resolve_outdated_inline_threads_soft_fails(self, gitlab_provider):
         self._prepare_outdated_cleanup(gitlab_provider, [])
@@ -2813,6 +2981,25 @@ class TestGitLabIncrementalReview:
         assert gitlab_provider.unreviewed_files_map == {}
         mock_project.repository_compare.assert_not_called()
 
+    def test_latest_commit_url_reuses_incremental_commits_fetch(self, gitlab_provider, mock_project):
+        gitlab_provider.mr.notes.list.return_value = [
+            self._make_note(7, "## PR Reviewer Guide 🔍\nbody", "2024-05-01T10:00:00Z"),
+        ]
+        gitlab_provider.mr.commits.return_value = [
+            SimpleNamespace(
+                id="new", committed_date="2024-05-01T11:00:00Z", web_url="https://gitlab.com/test/repo/-/commit/new"
+            ),
+            SimpleNamespace(
+                id="old", committed_date="2024-05-01T09:00:00Z", web_url="https://gitlab.com/test/repo/-/commit/old"
+            ),
+        ]
+        mock_project.repository_compare.return_value = {"diffs": []}
+
+        gitlab_provider.get_incremental_commits(IncrementalPR(True))
+
+        assert gitlab_provider.get_latest_commit_url() == "https://gitlab.com/test/repo/-/commit/new"
+        gitlab_provider.mr.commits.assert_called_once_with(per_page=100)
+
     def test_get_incremental_commits_no_anchor_commit_falls_back(self, gitlab_provider, mock_project):
         # All commits are after the previous review -> no last_seen_commit -> can't anchor.
         gitlab_provider.mr.notes.list.return_value = [
@@ -3105,10 +3292,6 @@ class TestGitLabIncrementalReview:
         assert gitlab_provider.unreviewed_files_map == {}
         mock_project.repository_compare.assert_not_called()
 
-    def test_supports_incremental_kind(self, gitlab_provider):
-        assert gitlab_provider.supports_incremental_kind("review") is True
-        assert gitlab_provider.supports_incremental_kind("suggestions") is True
-        assert gitlab_provider.supports_incremental_kind("something-else") is False
 
     def test_get_incremental_commits_invalidates_cached_diff_files(self, gitlab_provider):
         # Server mode caches the provider per PR URL: a diff computed by an earlier command
@@ -3449,7 +3632,8 @@ class TestGitLabRelevantDiff:
     version anchors the comment to a superseded diff — the state a force-push leaves behind."""
 
     # the versions endpoint is ordered newest-first
-    VERSIONS = ["newest", "older", "oldest"]
+    VERSIONS = [SimpleNamespace(base_commit_sha="base", start_commit_sha="base", head_commit_sha=head)
+                for head in ("head", "older", "oldest")]
 
     def _provider(self, changes):
         provider = GitLabProvider.__new__(GitLabProvider)
@@ -3465,18 +3649,17 @@ class TestGitLabRelevantDiff:
         }
         provider.id_project = "group/repo"
         provider.id_mr = 1
-        provider.last_diff = "latest-at-construction"
         return provider
 
     def test_matching_change_resolves_to_the_newest_version(self):
         provider = self._provider([{"new_path": "app.py", "diff": "@@\n+added line\n"}])
 
-        assert provider.get_relevant_diff("app.py", "+added line") == "newest"
+        assert provider.get_relevant_diff("app.py", "+added line") is self.VERSIONS[0]
 
-    def test_fallback_uses_the_latest_version_not_the_oldest(self):
+    def test_fallback_uses_the_latest_version(self):
         provider = self._provider([{"new_path": "other.py", "diff": "@@\n+unrelated\n"}])
 
-        assert provider.get_relevant_diff("app.py", "+added line") == "latest-at-construction"
+        assert provider.get_relevant_diff("app.py", "+added line") is self.VERSIONS[0]
 
     def test_returns_none_when_the_mr_has_no_diff_versions(self):
         provider = self._provider([{"new_path": "app.py", "diff": "@@\n+added line\n"}])
@@ -3484,23 +3667,14 @@ class TestGitLabRelevantDiff:
 
         assert provider.get_relevant_diff("app.py", "+added line") is None
 
-    def test_set_merge_request_snapshots_the_newest_version(self):
-        provider = GitLabProvider.__new__(GitLabProvider)
-        mr = MagicMock()
-        mr.diffs.list.return_value = list(self.VERSIONS)
-        with patch.object(GitLabProvider, "_parse_merge_request_url", return_value=("group/repo", 1)), \
-             patch.object(GitLabProvider, "_get_merge_request", return_value=mr):
-            provider._set_merge_request("https://gitlab.com/group/repo/-/merge_requests/1")
+    @pytest.mark.parametrize("ref", ["base", "start", "head"])
+    def test_missing_version_ref_is_rejected(self, ref):
+        provider = self._provider([{"new_path": "app.py", "diff": "@@\n+added line\n"}])
+        latest = SimpleNamespace(base_commit_sha="base", start_commit_sha="base", head_commit_sha="head")
+        setattr(latest, f"{ref}_commit_sha", None)
+        provider.mr.diffs.list.return_value = [latest]
 
-        assert provider.last_diff == "newest"
-
-    def test_fallback_is_logged_once_not_once_per_version(self):
-        provider = self._provider([{"new_path": "other.py", "diff": "@@\n+unrelated\n"}])
-
-        with patch("pr_agent.git_providers.gitlab_provider.get_logger") as mock_logger:
-            provider.get_relevant_diff("app.py", "+added line")
-
-        assert mock_logger.return_value.debug.call_count == 1
+        assert provider.get_relevant_diff("app.py", "+added line") is None
 
 
 class TestGitLabProviderUrlParsing:

@@ -26,12 +26,14 @@ See [Configuration options](../usage-guide/configuration_options.md#global-confi
 | --- | --- | --- |
 | `max_webhook_request_body_bytes` | 5242880 | maximum request body accepted by webhook servers (5 MiB) |
 | `bot_display_name` | "PR-Agent" | product name shown in user-visible PR comments; host-only, repo settings and comment args cannot set it |
+
 **models**
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `model` | "gpt-6.1-sol" |  |
 | `fallback_models` | ["gpt-6-luna"] |  |
+
 **CLI**
 
 | Key | Default | Description |
@@ -39,15 +41,15 @@ See [Configuration options](../usage-guide/configuration_options.md#global-confi
 | `git_provider` | "github" |  |
 | `publish_output` | true |  |
 | `publish_output_progress` | true |  |
-| `progress_gif_url` | "" | optional, override for the progress loading gif url (example: 'https://.../spinner.gif'). |
-| `progress_gif_width` | 48 | optional, width (in px) of the progress loading gif. |
 | `verbosity_level` | 0 | 0,1,2 |
 | `use_extra_bad_extensions` | false |  |
+
 **Log**
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `log_level` | "INFO" |  |
+
 **Configurations**
 
 | Key | Default | Description |
@@ -61,7 +63,7 @@ See [Configuration options](../usage-guide/configuration_options.md#global-confi
 | `per_directory_settings_max_tree_pages` | 10 | maximum GitLab recursive-tree pages (100 entries each); skip nested settings if discovery is incomplete. Root/host-controlled, independent of the settings-file cap. |
 | `extra_config_url` | "" | optional URL or path to an additional .pr_agent.toml merged before the repo-local config; also settable via --extra_config_url or PR_AGENT_EXTRA_CONFIG_URL. See docs/docs/usage-guide/configuration_options.md#external-configuration-url. |
 | `disable_auto_feedback` | false |  |
-| `enable_auto_approval` | false | when true, /review may auto-approve a PR via auto_approve_logic(); that caller is currently commented out |
+| `enable_auto_approval` | false | host-only. /review approves or withdraws its approval of the reviewed GitHub or GitLab commit; see docs/docs/commands/review.md |
 | `ai_timeout` | 120 | 2 minutes |
 | `http_request_timeout` | 60 | host-only connect/read inactivity seconds for GitLab/Gitea and direct Bitbucket/Gerrit HTTP attempts; capped at 600 |
 | `retry_same_model_on_timeout` | true | when false, a timed-out call is not retried on the same model and moves on to fallback_models |
@@ -69,7 +71,8 @@ See [Configuration options](../usage-guide/configuration_options.md#global-confi
 | `num_retries` | 4 | same-model retries of a request the provider rejects (429, 5xx, connection error) before fallback_models, waiting for its Retry-After (up to 30 s) or with exponential backoff; 0 falls back at once. Timeouts and empty responses use retry_same_model_on_timeout / retry_same_model_on_length instead |
 | `skip_keys` | [] |  |
 | `custom_reasoning_model` | false | when true, disables system messages and temperature controls for models that don't support chat-style inputs |
-| `system_instructions` | "" | Host-only instructions appended to every tool's system prompt; repository settings and comment arguments cannot set it. |
+| `system_instructions` | "" | Host-only instructions appended to every command's system prompt; repository settings and comment arguments cannot set it. |
+| `custom_comment_footer` | "" | Host-only Markdown text added to the end of command results, including /describe PR descriptions. See [docs](additional_configurations.md). |
 | `response_language` | "en-US" | PR response locale (e.g., "en-US", "it-IT"), also used for fixed comment text; applies only during each command. See additional_configurations.md. |
 | `repo_context_files` | ["AGENTS.md"] | Prompt context files: paths, alternatives, globs, sibling entries; [] disables. See [docs](additional_configurations.md). |
 | `repo_context_from_default_branch` | true | Read repo context files from the repository default branch (trusts only default-branch content). Set to false to read from the PR target branch instead. |
@@ -77,18 +80,21 @@ See [Configuration options](../usage-guide/configuration_options.md#global-confi
 | `repo_context_expand_imports` | false | Expand @path imports in local context files; comment arguments cannot set it. See [docs](additional_configurations.md). |
 | `repo_context_max_glob_matches` | 20 | Maximum number of files one repo_context_files glob entry (e.g. "docs/adr/*.md") expands to, in name order; each match is one file fetch. A repository's .pr_agent.toml may set it, comment arguments cannot. Clamped to 100. Matches still share the repo_context_max_lines budget. |
 | `repo_context_sibling_repos` | [] | Host-only list of approved sibling repository identifiers (GitHub owner/repo, GitLab group/project or numeric ID strings) that repo_context_files sibling entries may select. On GitHub and GitLab, this also approves repositories for cross-repository issue and ticket context. Empty disables sibling reads. Approve only repositories whose content may be disclosed in consuming PRs, because the actor check bounds who triggers a read, not who chose the target or where the output lands. Repository settings and comment arguments cannot change this list. Canonical identities and owning namespaces are checked after resolution |
+| `repo_context_sibling_namespaces` | [] | Host-only list of additional org/group/workspace names an approved repo_context_sibling_repos entry (or an expanded gitlab.expand_submodule_diffs gitlink) may resolve into. Empty, the default, keeps the reviewed repository's own namespace as the only approved one. Set it where a project's dependencies live in sibling groups rather than its own, e.g. a submodule in a shared library group. It widens namespaces only: a repository still has to be in repo_context_sibling_repos, and the requester's read access is still checked. Repository settings and comment arguments cannot change this list |
 | `repo_context_max_sibling_files` | 5 | Maximum number of sibling-repository files fetched per repo-context build. The fetch count is bounded separately from repo_context_max_lines so selected sibling files cannot trigger an unbounded number of cross-repository calls; sibling files still compete for the repo_context_max_lines budget. Host-only (cannot be raised by a repository's .pr_agent.toml or a comment command) and clamped to a hard ceiling of 20 fetches per build. |
+
 **token limits**
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `max_description_tokens` | 500 |  |
-| `max_commits_tokens` | 500 | Token cap on the commit messages sent to the model by /describe, /review, /improve and other tools. 0 means no limit; -1 sends none. |
-| `max_model_tokens` | 32000 | Limits the maximum number of tokens that can be used by any model, regardless of the model's default capabilities. |
+| `max_commits_tokens` | 500 | Token cap on the commit messages sent to the model by /describe, /review, /improve and other commands. 0 means no limit; -1 sends none. |
+| `max_model_tokens` | 256000 | Limits the maximum number of tokens that can be used by any model, regardless of the model's default capabilities. |
 | `custom_model_max_tokens` | -1 | Override unknown models or Sol-tier GPT-6 on non-native custom providers. |
 | `max_output_tokens` | 0 | 0 = unset (the provider's own default applies) |
 | `model_token_count_estimate_factor` | 0.3 | factor to increase the token count estimate, in order to reduce likelihood of model failure due to too many tokens - applicable only when requesting an accurate estimate. |
 | `image_input_token_allowance` | 4096 | reserve tokens per image when provider counting omits or underestimates image cost |
+
 **patch extension logic**
 
 | Key | Default | Description |
@@ -106,12 +112,14 @@ See [Configuration options](../usage-guide/configuration_options.md#global-confi
 | `large_patch_policy` | "clip" | "clip" (default) or "skip"; a missing value is treated as "clip" |
 | `duplicate_prompt_examples` | false |  |
 | `persistent_inline_comments` | false | Enable persistent inline comments (issue #2037) to fingerprint each inline comment and embed a provider-compatible marker, then skip re-posting suggestions already present on the PR/MR across runs. |
+
 **seed**
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `seed` | -1 | set positive value to fix the seed (and ensure temperature=0) |
 | `temperature` | 0.2 |  |
+
 **ignore logic**
 
 | Key | Default | Description |
@@ -130,12 +138,14 @@ See [Configuration options](../usage-guide/configuration_options.md#global-confi
 | `bot_user_indicators` | ["codium", "bot_", "bot-", "_bot", "-bot"] | Substring indicators used to skip bot users on webhook events. Currently consumed by the GitLab webhook (`is_bot_user`); other providers may adopt this list in future. The match is case-insensitive against the sender's display name. Overriding this setting REPLACES the default list — include the entries below in your override if you want to keep them (e.g. `["codium", "bot_", "bot-", "_bot", "-bot", "renovate"]`). |
 | `restricted_mode` | false | when true, skip operations that require elevated permissions (e.g. pushing code to the repository) |
 | `is_auto_command` | false | will be auto-set to true if the command is triggered by an automation |
-| `propagate_tool_errors` | false | when true, a tool re-raises instead of swallowing an internal error, so a caller can tell a failed run from an empty one |
+| `skip_unchanged_diff` | false | skip automatic or CLI /review and /describe when the PR is unchanged since their last successful run. See docs/docs/usage-guide/automations_and_usage.md |
+| `propagate_command_errors` | false | when true, a command re-raises instead of swallowing an internal error, so a caller can tell a failed run from an empty one |
 | `enable_ai_metadata` | false | will enable adding ai metadata |
 | `add_user_to_requests` | false | send the current command and PR URL in the OpenAI-compatible "user" request field, for provider-side attribution of requests (e.g. OpenRouter "external_user") |
 | `reasoning_effort` | "medium" | "none", "minimal", "low", "medium", "high", "xhigh", "max" |
 | `additional_reasoning_effort_models` | [] | Optional: additional model IDs that accept config.reasoning_effort. Reasoning support is otherwise decided by litellm's bundled model metadata (and the maintained Grok registry), so add an ID here when litellm does not know the model (custom OpenAI-compatible endpoints), or when another provider hosts a Sol-tier GPT-6 model under the same ID. Model IDs match exactly or through any provider prefix (e.g. "deepseek-v4-flash-0731" matches "openai/deepseek-v4-flash-0731"). LiteLLM whitelists reasoning_effort through allowed_openai_params for OpenAI-compatible models it does not recognize, so the parameter reaches the endpoint. The default "medium" may be rejected by providers that accept a different subset (e.g. "none"/"low"/"high"/"max"); adding a custom model id now surfaces a provider-side error instead of the previous silent drop. |
 | `no_temperature_models` | ["deepseek/deepseek-reasoner", "o1-mini", "o1-mini-2024-09-12", "o1", "o1-2024-12-17", "o3-mini", "o3-mini-2025-01-31", "o3", "o3-2025-04-16", "o4-mini", "o4-mini-2025-04-16", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5-mini", "moonshotai.kimi-k3", "us.moonshotai.kimi-k3", "global.moonshotai.kimi-k3", "kimi-k3", "kimi-k3.1-pro", "zai.glm-5"] | Optional: model IDs that must never receive the temperature parameter, on top of what litellm's parameter metadata reports. Temperature support is otherwise decided by litellm.get_supported_openai_params() (mirroring reasoning_effort), so add an ID here when litellm reports temperature as supported but the provider rejects it, or when an OpenAI-compatible endpoint accepts but you still want it dropped. Adaptive-thinking Claude models (Opus 4.7/4.8, Opus/Sonnet/Fable 5.x and Haiku 5.5) never receive temperature. Match model IDs exactly or through any provider prefix. For OpenRouter `:nitro` and `:floor` routing shortcuts, also match the suffix-free base ID (for example, match `future-model` to `openrouter/vendor/future-model:nitro`). Keep other model variants at their full ID. Preserve the former static registry entries below when litellm's metadata still marks them temperature-capable; see #3611 (Derive temperature support from LiteLLM metadata and retire NO_SUPPORT_TEMPERATURE_MODELS) for the probe diff. Bedrock rejects temperature for Kimi K3 and GLM-5 ("This model doesn't support the temperature field"); Moonshot/Kimi reasoning endpoints reject custom temperature. |
+
 **extended thinking for Claude reasoning models**
 
 | Key | Default | Description |
@@ -146,14 +156,14 @@ See [Configuration options](../usage-guide/configuration_options.md#global-confi
 | `enable_claude_adaptive_thinking` | false | Adaptive thinking for Claude Opus 4.7/4.8 and Claude 5 models. When enabled, these models receive thinking={"type": "adaptive"} and an output_config effort. Do not add adaptive-only models to claude_extended_thinking_models_override; when both features are enabled, adaptive thinking takes precedence. |
 | `claude_adaptive_thinking_models_override` | [] | Optional model ids to treat as adaptive-only Claude models, including opaque Bedrock ARNs. See [changing a model](changing_a_model.md). |
 | `claude_extended_thinking_models_override` | [] | Optional: override the built-in list of Claude models that receive the extended-thinking payload. When non-empty, this list fully replaces the built-in defaults (see CLAUDE_EXTENDED_THINKING_MODELS in pr_agent/algo/__init__.py). Leave empty to use the defaults. |
-| `extract_issue_from_branch` | true | Extract issue number from PR source branch name (e.g. feature/1-auth-google -> issue #1). When true, branch-derived issue URLs are merged with tickets from the PR description for compliance. Set to false to restore description-only behaviour. Note: Branch-name extraction is GitHub-only for now; other providers planned for later. |
-| `branch_issue_regex` | "" | Optional: custom regex with one or more capturing groups for the issue number (validated at runtime); only the first group is used. If the regex has no capturing group, the default pattern is used; if it does not compile, no branch tickets are extracted. If empty, uses default pattern: first 1-6 digits at start of branch or after a slash, followed by hyphen or end (e.g. feature/1-test, 123-fix). GitHub only; other providers planned for later. |
+| `extract_issue_from_branch` | true | Infer branch issues on GitHub and same-project GitLab (`123-...`); false disables. See https://docs.pr-agent.ai/core-abilities/fetching_ticket_context/. |
+| `branch_issue_regex` | "" | Optional: custom regex with one or more capturing groups for the issue number (validated at runtime); only the first group is used. If the regex has no capturing group, the default pattern is used; if it does not compile, no branch tickets are extracted. If empty, uses default pattern: first 1-6 digits at start of branch or after a slash, followed by hyphen or end (e.g. feature/1-test, 123-fix), skipping date prefixes such as release/2026-11-15. GitHub only; other providers planned for later. |
 | `description_issue_regex` | "" | Configure a regex replacing bare #N references, with exactly one capturing group for an ASCII issue number. Leave empty for default matching (up to six digits); fall back with a warning on invalid patterns. Set the custom digit limit in the pattern; use only integer-parseable captures. Keep full URLs and owner/repo#N references. Use TOML literal quotes to preserve backslashes, e.g. description_issue_regex = '(?i)(?:fixes\|closes\|resolves)\s+#(\d+)' |
 
 
 ## `[pr_reviewer]` — /review {#pr_reviewer-review}
 
-See [Review](../tools/review.md#configuration-options).
+See [Review](../commands/review.md#configuration-options).
 
 **enable/disable features**
 
@@ -169,13 +179,16 @@ See [Review](../tools/review.md#configuration-options).
 | `require_ticket_analysis_review` | true |  |
 | `require_risk_assessment` | false | ask the model for an overall risk level (low/medium/high) |
 | `require_merge_recommendation` | false | ask the model for a merge recommendation: no_concerns_found (no important blockers or risks identified), needs_review (seems acceptable but deserves focused reviewer attention) or changes_required (clear issues to fix before merge) |
+| `max_changed_lines` | 100 | Host-only changed-line cap; a larger diff vetoes no_concerns_found. See docs/docs/commands/review.md |
+| `publish_merge_recommendation_status` | false | Publish the computed verdict as a SHA-scoped check/commit status. See docs/docs/commands/review.md |
 | `require_failure_modes` | false | ask for up to three concrete failure scenarios and their detection/coverage |
-| `require_artifact_findings` | false | with a CI artifact, list up to five neutral facts from it, each with a quote checked against the artifact. See docs/docs/tools/review.md |
+| `require_artifact_findings` | false | with a CI artifact, list up to five neutral facts from it, each with a quote checked against the artifact. See docs/docs/commands/review.md |
 | `require_priority_files` | false | ask the model which files a human should inspect first |
-| `structural_reach_input_file` | "" | JSON reach facts from a build-graph tool; when the file exists, adds a deterministic change-risk row. See docs/docs/tools/review.md |
-| `enable_risk_checks` | true | Flag sensitive paths and risky change shapes; adds nothing when clean. See docs/docs/tools/review.md |
-| `sensitive_paths` | [".github/workflows/**", ".gitlab-ci.yml", "Jenkinsfile*", ".circleci/**", "azure-pipelines*.yml", ".travis.yml", "bitbucket-pipelines.yml", "*CODEOWNERS", ".pr_agent.toml", "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "requirements*.txt", "Pipfile", "Pipfile.lock", "pyproject.toml", "poetry.lock", "uv.lock", "Cargo.toml", "Cargo.lock", "go.mod", "go.sum", "pom.xml", "build.gradle*", "Gemfile", "Gemfile.lock", "composer.json", "composer.lock", "*Dockerfile*", "docker-compose*.yml", "docker-compose*.yaml", "*.dockerfile", "*.tf", "*.tfvars", "*.hcl", "*migrations*/**", "*migration*", "db/migrate/**", "alembic/**"] | Glob patterns of sensitive paths flagging deterministic review risk findings. See docs/docs/tools/review.md |
-| `extra_risky_shapes` | [] | Custom regex patterns flagging risky changes in diff hunks. See docs/docs/tools/review.md |
+| `structural_reach_input_file` | "" | JSON reach facts from a build-graph tool; when the file exists, adds a deterministic change-risk row. See docs/docs/commands/review.md |
+| `enable_risk_checks` | true | Flag sensitive paths and risky change shapes; adds nothing when clean. See docs/docs/commands/review.md |
+| `sensitive_paths` | [".github/workflows/**", ".github/actions/**", ".gitlab-ci.yml", "Jenkinsfile*", ".circleci/**", "azure-pipelines*.yml", ".travis.yml", "bitbucket-pipelines.yml", "*CODEOWNERS", ".pr_agent.toml", "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "requirements*.txt", "Pipfile", "Pipfile.lock", "pyproject.toml", "poetry.lock", "uv.lock", "Cargo.toml", "Cargo.lock", "go.mod", "go.sum", "pom.xml", "build.gradle*", "Gemfile", "Gemfile.lock", "composer.json", "composer.lock", "*Dockerfile*", "docker-compose*.yml", "docker-compose*.yaml", "*.dockerfile", "*.tf", "*.tfvars", "*.hcl", "*migrations*/**", "*migration*", "db/migrate/**", "alembic/**"] | Glob patterns of sensitive paths flagging deterministic review risk findings. See docs/docs/commands/review.md |
+| `extra_risky_shapes` | [] | Custom regex patterns flagging risky changes in diff hunks. See docs/docs/commands/review.md |
+
 **general options**
 
 | Key | Default | Description |
@@ -184,13 +197,16 @@ See [Review](../tools/review.md#configuration-options).
 | `publish_review_failure_comment` | true | Set to false to suppress review failure comments without changing the command's failure status. |
 | `publish_error_details` | false | Publish a deterministic, sanitized failure reason in manual review comments. No AI call is used. |
 | `persistent_comment` | true |  |
+| `per_commit_review` | false | Review each PR commit on its own diff and message, one review per commit. See [per commit review](../commands/review.md#reviewing-each-commit-separately). |
+| `max_commits_per_review` | 0 | Optional cap on the commits per_commit_review reviews one by one; above it, the whole PR is reviewed in one review. 0 means no limit. |
 | `review_heading` | "PR Reviewer Guide" | Visible base heading for full and incremental review comments. Identity is tracked separately. |
 | `persistent_finding_state` | true | Persist review finding state across complete review runs. |
 | `max_previous_findings_chars` | 8000 | Character budget for the findings stored by earlier reviews, given to /review as context so it keeps their wording instead of re-raising them reworded, and skips findings whose GitHub or GitLab inline thread someone other than PR-Agent resolved (needs persistent_finding_state); 0 disables it. |
 | `show_previous_findings_summary` | true | Show a 'Since the last review' section at the top of the review: addressed, reappeared, still-open and new findings (needs persistent_finding_state). |
-| `inline_key_issues` | false | Publish each review finding as an inline comment where the provider can verify inline-comment publication (GitHub, Bitbucket Cloud, Azure DevOps, GitLab, Gitea). |
+| `inline_key_issues` | true | Publish each review finding as an inline comment where the provider can verify inline-comment publication (GitHub, Bitbucket Cloud, Azure DevOps, GitLab, Gitea). Findings with a fix become committable suggestions when pr_code_suggestions.committable_code_suggestions is on. Set to false to keep every finding in the review summary. |
+| `min_finding_confidence` | 0 | Drop findings below this model-reported confidence (0-10); 0 keeps every finding and does not ask the model for one. |
 | `extra_instructions` | "" |  |
-| `num_max_findings` | 3 |  |
+| `num_max_findings` | 6 | maximum number of key issues /review reports (integer; default 6) |
 | `final_update_message` | true |  |
 
 Azure DevOps also supplies verified PR-Agent inline key issues as dismissed when their status is `wontFix`
@@ -206,6 +222,7 @@ it cannot verify the status-changing actor or historical defaults. Dismissed fin
 | --- | --- | --- |
 | `enable_review_labels_security` | true |  |
 | `enable_review_labels_effort` | true |  |
+
 **specific configurations for incremental review (/review -i)**
 
 | Key | Default | Description |
@@ -216,14 +233,14 @@ it cannot verify the status-changing actor or historical defaults. Dismissed fin
 | `enable_intro_text` | true |  |
 | `enable_help_text` | false | Determines whether to include help text in the PR review. |
 | `enable_review_coverage_footer` | true |  |
-| `enable_risk_aware_compression` | false | Prioritize risky files and related tests in oversized /review diffs; requires enable_risk_checks. See docs/docs/tools/review.md. |
+| `enable_risk_aware_compression` | false | Prioritize risky files and related tests in oversized /review diffs; requires enable_risk_checks. See docs/docs/commands/review.md. |
 | `enable_large_pr_chunking` | false | large-diff chunking (opt-in). When the token budget leaves files out of the review, split the diff into chunks, review each chunk, and merge the per-chunk results into one review. |
 | `max_number_of_calls` | 3 | maximum number of chunk review calls, used only when enable_large_pr_chunking is true |
 
 
 ## `[pr_description]` — /describe {#pr_description-describe}
 
-See [Describe](../tools/describe.md#configuration-options).
+See [Describe](../commands/describe.md#configuration-options).
 
 | Key | Default | Description |
 | --- | --- | --- |
@@ -239,12 +256,14 @@ See [Describe](../tools/describe.md#configuration-options).
 | `enable_pr_diagram` | true | adds a section with a diagram of the PR changes |
 | `pr_diagram_direction` | "adaptive" | 'adaptive', 'LR', 'TD'. 'adaptive' picks the direction from the shape of the diagram |
 | `pr_diagram_direction_threshold` | 5 | with 'adaptive', a chain longer than this many nodes is drawn top-down |
+
 **describe as comment**
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `publish_description_as_comment` | false |  |
 | `publish_description_as_comment_persistent` | true |  |
+
 **changes walkthrough section**
 
 | Key | Default | Description |
@@ -253,6 +272,7 @@ See [Describe](../tools/describe.md#configuration-options).
 | `collapsible_file_list` | "adaptive" | true, false, 'adaptive' |
 | `collapsible_file_list_threshold` | 6 |  |
 | `file_table_collapsible_open_by_default` | false |  |
+
 **markers**
 
 | Key | Default | Description |
@@ -266,13 +286,13 @@ See [Describe](../tools/describe.md#configuration-options).
 
 ## `[pr_questions]` — /ask {#pr_questions-ask}
 
-See [Ask](../tools/ask.md#configuration-options).
+See [Ask](../commands/ask.md#configuration-options).
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `enable_help_text` | false |  |
 | `use_conversation_history` | true |  |
-| `use_ticket_context` | false | Include linked ticket context in top-level /ask when true; default false. See tools/ask.md#linked-ticket-context. |
+| `use_ticket_context` | false | Include linked ticket context in top-level /ask when true; default false. See commands/ask.md#linked-ticket-context. |
 | `ask_heading` | "Ask" | Set the plain-text heading for top-level /ask answers; provider-specific presentation is added automatically. |
 | `resolve_threads` | false | Enable to let /ask_line resolve the review thread when the LLM judges the issue addressed. Note: also resolves threads started by human reviewers. |
 | `extra_instructions` | "" |  |
@@ -280,66 +300,33 @@ See [Ask](../tools/ask.md#configuration-options).
 
 ## `[pr_code_suggestions]` — /improve {#pr_code_suggestions-improve}
 
-See [Improve](../tools/improve.mdx#configuration-options).
+See [Fixes and committable suggestions](../commands/review.md#fixes-and-committable-suggestions).
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `committable_code_suggestions` | false | Deprecated alias still accepted until 1.0: pr_code_suggestions.commitable_code_suggestions |
-| `dual_publishing_score_threshold` | -1 | Not settable from a per-directory .pr_agent.toml. -1 or 0 disables, [1-10] also publishes suggestions scoring >= it as committable, besides the table. |
-| `focus_only_on_problems` | true |  |
 | `extra_instructions` | "" |  |
-| `suggestions_heading` | "PR Code Suggestions" | Visible base heading for summary-table /improve comments. Identity is tracked separately. |
-| `enable_help_text` | false |  |
-| `enable_chat_text` | false |  |
-| `persistent_comment` | true |  |
-| `publish_failure_comment` | true | Set to false to suppress /improve failure comments without changing the command's failure status. |
-| `max_history_len` | 4 | Previous sets to retain; <=0 keeps latest only (same comment if editable). See https://docs.pr-agent.ai/tools/improve#configuration-options |
-| `publish_output_no_suggestions` | true |  |
-| `enable_suggestions_coverage_footer` | true | show failed chunks and files omitted by the token or AI-call budget |
-**suggestions scoring**
-
-| Key | Default | Description |
-| --- | --- | --- |
-| `suggestions_score_threshold` | 1 | [0-10]\| 0 is treated as 1; recommend not to set this value above 8, since above it may clip highly relevant suggestions |
-| `score_on_reflection_failure` | 7 | [0-10]\| score assigned when self-reflection fails or its feedback cannot be parsed; set below suggestions_score_threshold to drop unvetted suggestions |
-| `new_score_mechanism` | true |  |
-| `new_score_mechanism_th_high` | 9 |  |
-| `new_score_mechanism_th_medium` | 7 |  |
-**params for '/improve --extended' mode**
-
-| Key | Default | Description |
-| --- | --- | --- |
-| `num_code_suggestions_per_chunk` | 3 |  |
-| `max_suggestions_per_file` | 0 | Maximum suggestions retained per file after all chunks are merged; 0 disables the cap. Skip unresolvable line locations before applying a positive cap to summarized output; leave inline selection unchanged. |
-| `max_discussion_context_chars` | 24000 | Character budget for prior code-suggestion threads given to /improve as context (GitLab, Azure DevOps); 0 disables it. |
-| `max_number_of_calls` | 3 |  |
-| `parallel_calls` | true |  |
-| `decouple_hunks` | false |  |
-**self-review checkbox**
-
-| Key | Default | Description |
-| --- | --- | --- |
-| `demand_code_suggestions_self_review` | false | add a checkbox for the author to self-review the code suggestions |
-| `code_suggestions_self_review_text` | "**Author self-review**: I have reviewed the PR code suggestions, and addressed the relevant ones." |  |
+| `suggestions_heading` | "PR Code Suggestions" | Visible base heading for code-suggestion comments. Identity is tracked separately. |
 
 
 ## `[pr_add_docs]` — /add_docs {#pr_add_docs-add_docs}
 
-See [Add Docs](../tools/add_docs.md#configuration-options).
+See [Add Docs](../commands/add_docs.md#configuration-options).
 
 | Key | Default | Description |
 | --- | --- | --- |
 | `extra_instructions` | "" |  |
-| `docs_style` | "Sphinx" | "Google Style with Args, Returns, Attributes...etc", "Numpy Style", "Sphinx Style", "PEP257", "reStructuredText" |
+| `docs_style` | "Sphinx" | Docstring style: Google Style with Args, Returns, Attributes...etc; Numpy Style; Sphinx; PEP257; reStructuredText. See docs/docs/commands/add_docs.md. |
+| `use_repo_context` | true | Include repository instructions in /add_docs when they fit (true/false); see commands/add_docs.md. |
 
 
 ## `[pr_update_changelog]` — /update_changelog {#pr_update_changelog-update_changelog}
 
-See [Update Changelog](../tools/update_changelog.md#configuration-options).
+See [Update Changelog](../commands/update_changelog.md#configuration-options).
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `changelog_path` | "CHANGELOG.md" | Repository-relative Markdown changelog path. Root .pr_agent.toml or host settings only; see tools/update_changelog.md. |
+| `changelog_path` | "CHANGELOG.md" | Repository-relative Markdown changelog path. Root .pr_agent.toml or host settings only; see commands/update_changelog.md. |
 | `push_changelog_changes` | false |  |
 | `extra_instructions` | "" |  |
 | `add_pr_link` | true |  |
@@ -354,7 +341,7 @@ _This section only documents commented-out examples; see the [TOML source](https
 
 ## `[pr_help_docs]` {#pr_help_docs}
 
-See [Help Docs](../tools/help_docs.md#configuration-options).
+See [Help Docs](../commands/help_docs.md#configuration-options).
 
 | Key | Default | Description |
 | --- | --- | --- |
@@ -383,7 +370,7 @@ See [GitHub](../installation/github.md#run-as-a-github-app).
 | `base_url` | "https://api.github.com" |  |
 | `try_fix_invalid_inline_comments` | true |  |
 | `ignore_bot_pr` | true |  |
-| `publish_as_check_run` | false | when true, publish review/description/improve output as GitHub Checks instead of PR comments |
+| `publish_as_check_run` | false | when true, publish review/description output as GitHub Checks instead of PR comments |
 
 
 ## `[github_action_config]` {#github_action_config}
@@ -399,6 +386,7 @@ See [GitHub App](../usage-guide/automations_and_usage.md#github-app).
 | Key | Default | Description |
 | --- | --- | --- |
 | `override_deployment_type` | true | these toggles allows running the github app from custom deployments |
+
 **settings for "pull_request" event**
 
 | Key | Default | Description |
@@ -411,7 +399,7 @@ See [GitHub App](../usage-guide/automations_and_usage.md#github-app).
 | `webhook_delivery_deduplication` | false | Opt in to in-memory deduplication by X-GitHub-Delivery within each worker process. Active work stays protected; completed IDs expire after the deployment's push_trigger_pending_tasks_ttl (read at startup, 300 seconds by default). Failed or cancelled work can retry immediately. Repeated deliveries do not extend the TTL. Manual redeliveries are also suppressed during this window. State is cleared on restart and is not shared across workers or replicas. |
 | `handle_push_trigger` | false | settings for "pull_request" event with "synchronize" action - used to detect and handle push triggers for new commits |
 | `push_trigger_ignore_bot_commits` | true |  |
-| `push_trigger_ignore_merge_commits` | true |  |
+| `push_trigger_ignore_merge_commits` | true | skip push_commands when the push only merges the base branch into the previous head, as "Update branch" does |
 | `push_trigger_pending_tasks_backlog` | true | GitHub App only. Keep one queued push-trigger task per PR instead of dropping it; other servers always queue. |
 | `push_trigger_pending_tasks_ttl` | 300 | GitHub App only. Seconds idle per-PR push-trigger state is kept (other servers: 300); also the dedupe window when webhook_delivery_deduplication is on. |
 | `push_commands` | ["/describe", "/review"] |  |
@@ -427,14 +415,13 @@ See [GitLab](../usage-guide/automations_and_usage.md#gitlab-webhook).
 | `expand_submodule_diffs` | false | Submodule targets must also be listed in config.repo_context_sibling_repos. |
 | `feedback_on_draft_pr` | false |  |
 | `publish_review_as_thread` | false | Post the /review summary as a resolvable thread (discussion) instead of a plain note. |
-| `publish_improve_as_thread` | false | Post the /improve suggestions comment as a resolvable thread (discussion) instead of a plain note. |
 | `reply_to_trigger_comment` | false | Reply in the triggering GitLab discussion for `/review`, `/improve`, or `/ask` (true/false); see docs/docs/usage-guide/additional_configurations.md. |
 | `publish_code_suggestions_as_review` | false | When pr_code_suggestions.committable_code_suggestions is true, queue each suggestion as a GitLab draft note and publish them all together in one batch (like GitLab's own "start a review" flow) instead of posting each as its own live discussion - and its own notification - as soon as it's created. |
 | `resolve_outdated_inline_threads` | false | Resolve the bot's own inline threads that a later push left on an outdated diff version. |
 | `auto_resolve_fixed_inline_threads` | false | Resolve the bot's own inline threads whose flagged line was modified after the comment was posted - i.e. the diff between the comment's head sha and the current head sha removes/replaces that line. Unlike resolve_outdated_inline_threads this is content-based: threads on lines nobody touched (or merely shifted by unrelated insertions) stay open. |
 | `handle_push_trigger` | false |  |
 | `push_commands` | ["/describe", "/review"] |  |
-| `handle_reviewer_assignment` | false | Auto-trigger commands when the bot is assigned as a reviewer on an MR |
+| `handle_reviewer_assignment` | false | Auto-trigger commands when the bot is assigned or explicitly re-requested as a reviewer on an MR |
 | `reviewer_commands` | ["/review"] |  |
 | `ignore_user_ids` | [] | Numeric GitLab user IDs whose merge request and note events are skipped, checked before the config.bot_user_indicators display-name match. IDs are stable, unlike display names. Host-only: the check runs before repository settings are loaded (e.g. `GITLAB__IGNORE_USER_IDS=123`). |
 
@@ -517,11 +504,12 @@ See [Changing a model](../usage-guide/changing_a_model.md#changing-a-model-in-pr
 | Key | Default | Description |
 | --- | --- | --- |
 | `enable_callbacks` | false |  |
-| `add_session_id_to_requests` | false | send a stable x-litellm-session-id header derived from the PR URL, so LiteLLM groups every request for the same PR into one session |
+| `add_session_id_to_requests` | false | send a stable session id derived from the PR URL as x-litellm-session-id (LiteLLM session grouping) and the provider's session header (e.g. x-opencode-session) |
 | `success_callback` | [] | process-wide: only the deployment's configuration and environment set it, not a repo's .pr_agent.toml; in the Action, use a workflow env entry |
 | `failure_callback` | [] | process-wide, set like success_callback |
 | `service_callback` | [] | process-wide, set like success_callback |
-| `turn_off_message_logging` | false | set true to keep prompt/response content (the whole PR diff) out of callback payloads; strongly recommended with the "otel" callback |
+| `turn_off_message_logging` | false | omit prompts/responses from LiteLLM callbacks and PR-Agent's LiteLLM and OpenAI handler logs; recommended with the "otel" callback |
+| `suppress_debug_info` | true | hide LiteLLM's "Give Feedback / Get Help" stdout banner on provider errors; process-wide, set like success_callback |
 | `custom_llm_provider` | "" | Optional: forward a fixed custom_llm_provider to LiteLLM, so a raw hosted model id (e.g. "claude-sonnet-4-5") reaches the provider unchanged instead of being rewritten by LiteLLM's prefix inference. Empty = let LiteLLM infer the provider from the model name. |
 | `force_streaming_custom_llm_provider` | "" | Force streaming when the request matches this provider AND its api_base contains one of the substrings below. Some OpenAI-compatible endpoints return a response that LiteLLM cannot normalize in non-streaming mode. Both must be set for the workaround to apply. |
 | `force_streaming_api_base_substrings` | [] |  |
@@ -550,8 +538,8 @@ See [OpenRouter](../usage-guide/changing_a_model.md#openrouter).
 | `provider_only` | [] | restrict routing to these upstream providers only, a hard allowlist (e.g. ["z-ai"]); empty = OpenRouter default routing |
 | `provider_order` | [] | preferred provider order; ignored when provider_only is set; empty = unset |
 | `allow_fallbacks` | true | when provider_order is set, allow routing beyond the listed providers |
-| `reasoning_effort` | "" | Invalid reasoning_effort values are warned about and treated as unset. Empty inherits config.reasoning_effort for reasoning-capable models (probed against litellm's bundled reasoning metadata or the Grok registry, or listed in additional_reasoning_effort_models). Valid values: "none", "minimal", "low", "medium", "high", "xhigh", "max". OpenRouter normalizes "max" to "xhigh" for LiteLLM/OpenRouter compatibility. Model-specific support varies. For models not covered by PR-Agent's clamps, do not assume "none" disables reasoning; check the selected model and provider's support. |
-| `reasoning_max_tokens` | 0 | Use a positive value to override global effort and non-none OpenRouter-specific efforts. Keep reasoning disabled for explicit openrouter.reasoning_effort = "none", except on Grok 4.5/4.6, Gemini 3.7/3.8 Flash, and the GPT-6 models whose pages omit "none" (GPT-6 Astra and GPT-6.1 Sol). Clamp "none" to the lowest supported effort there before applying the budget, so a positive budget wins. Keep max_tokens greater than the reasoning budget where the provider requires it. |
+| `reasoning_effort` | "" | Invalid reasoning_effort values are warned about and treated as unset. Empty inherits config.reasoning_effort for reasoning-capable models (probed against litellm's bundled reasoning metadata or the Grok registry, or listed in additional_reasoning_effort_models). Valid values: "none", "minimal", "low", "medium", "high", "xhigh", "max". After model-specific clamps, OpenRouter normalizes remaining "max" values to "xhigh" for LiteLLM/OpenRouter compatibility. Model-specific support varies. For models not covered by PR-Agent's clamps, do not assume "none" disables reasoning; check the selected model and provider's support. |
+| `reasoning_max_tokens` | 0 | Use a positive value to override global effort and non-none OpenRouter-specific efforts. Keep reasoning disabled for explicit openrouter.reasoning_effort = "none", except on Grok 4.5/4.6, Gemini 3.7/3.8 Flash, Gemini 4 Argon/Hydrogen, and the GPT-6 models whose pages omit "none" (GPT-6 Astra and GPT-6.1 Sol). Clamp "none" to the lowest supported effort there before applying the budget, so a positive budget wins. Keep max_tokens greater than the reasoning budget where the provider requires it. |
 | `max_tokens` | 0 | hard cap on completion tokens for the request; 0 = unset |
 
 
@@ -584,7 +572,7 @@ See [Additional configurations](../usage-guide/additional_configurations.md#buil
 
 ## `[pr_similar_issue]` {#pr_similar_issue}
 
-See [Similar Issues](../tools/similar_issues.md#selecting-a-vector-database).
+See [Similar Issues](../commands/similar_issues.md#selecting-a-vector-database).
 
 | Key | Default | Description |
 | --- | --- | --- |
@@ -596,7 +584,7 @@ See [Similar Issues](../tools/similar_issues.md#selecting-a-vector-database).
 
 ## `[pinecone]` {#pinecone}
 
-See [Pinecone](../tools/similar_issues.md#pinecone-configuration).
+See [Pinecone](../commands/similar_issues.md#pinecone-configuration).
 
 | Key | Default | Description |
 | --- | --- | --- |
@@ -606,7 +594,7 @@ See [Pinecone](../tools/similar_issues.md#pinecone-configuration).
 
 ## `[lancedb]` {#lancedb}
 
-See [LanceDB](../tools/similar_issues.md#lancedb-configuration).
+See [LanceDB](../commands/similar_issues.md#lancedb-configuration).
 
 | Key | Default | Description |
 | --- | --- | --- |
@@ -615,7 +603,7 @@ See [LanceDB](../tools/similar_issues.md#lancedb-configuration).
 
 ## `[qdrant]` {#qdrant}
 
-See [Qdrant](../tools/similar_issues.md#qdrant-configuration).
+See [Qdrant](../commands/similar_issues.md#qdrant-configuration).
 
 _This section only documents commented-out examples; see the [TOML source](https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml) for details._
 
@@ -636,11 +624,11 @@ See [CI artifacts](../installation/github.md#ci-artifact-context).
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `enable` | false | Enable artifact injection into tool prompts (off by default; auto-enabled when artifact_path input is set) |
+| `enable` | false | Enable artifact injection into command prompts (off by default; auto-enabled when artifact_path input is set) |
 | `artifact_path` | "" | File path or list of paths to artifacts (relative to GITHUB_WORKSPACE, or absolute) |
 | `artifact_instructions` | "" | Analysis guidance rendered separately before the untrusted artifact label and content (leave empty for a sensible default) |
 | `artifact_label` | "" | Label shown to the AI — defaults to the filename when empty. |
-| `target_tools` | ["pr_reviewer", "pr_description", "pr_code_suggestions", "pr_questions"] | Which supported tools receive artifact context; unsupported names are skipped with a warning. |
+| `target_commands` | ["pr_reviewer", "pr_description", "pr_code_suggestions", "pr_questions"] | Which supported commands receive artifact context; unsupported names are skipped with a warning. |
 | `max_artifact_size` | 50000 | Max artifact size in characters (content is truncated if exceeded) |
 | `truncate_from` | "start" | Which end of the file to keep when truncating: "start" (default, keeps the beginning) or "end" (keeps the tail, where build logs carry their verdict - failure, plan summary or test result). |
 
@@ -694,7 +682,7 @@ See [Azure DevOps Server](../usage-guide/automations_and_usage.md#azure-devops-w
 | `agent_identity` | "" | Host-only GUID, unique name, descriptor, or list; empty resolves review authorship automatically. See installation/azure.md |
 
 
-## `[push_outputs]` — push tool outputs to external sinks without calling git-provider APIs (disabled by default) {#push_outputs-push tool outputs to external sinks without calling git-provider APIs (disabled by default)}
+## `[push_outputs]` — push command outputs to external sinks without calling git-provider APIs (disabled by default) {#push_outputs-push command outputs to external sinks without calling git-provider APIs (disabled by default)}
 
 See [Push outputs](../usage-guide/push_outputs.md#configuration).
 
@@ -702,7 +690,7 @@ See [Push outputs](../usage-guide/push_outputs.md#configuration).
 | --- | --- | --- |
 | `enable` | false |  |
 | `channels` | [] | exact names as a list/tuple or comma-separated string: "stdout", "file", "webhook", "slack", "telegram", "teams"; empty emits nothing |
-| `tools` | ["review", "describe", "improve"] | output types to deliver; add "ask" to include Q&A, or select fewer tools; supports comma-separated strings |
+| `commands` | ["review", "describe"] | output types; opt in to "ask" or "update_changelog"; accepts comma-separated strings. See docs/docs/usage-guide/push_outputs.md |
 | `file_path` | "pr-agent-outputs/reviews.jsonl" | used by the "file" channel |
 | `webhook_url` | "" | used by the "webhook" channel: generic JSON POST target. Must be an absolute https:// URL |
 | `slack_webhook_url` | "" | used by the "slack" channel: a Slack Incoming Webhook URL. Must be an absolute https:// URL |

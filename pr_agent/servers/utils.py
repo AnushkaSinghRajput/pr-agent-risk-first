@@ -1,17 +1,20 @@
 import asyncio
+import copy
 import hashlib
 import hmac
 import re
 import secrets
 import time
 from collections import defaultdict
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import HTTPException
+from starlette_context import context
 
+from pr_agent.algo.command_words import split_command_words
 from pr_agent.algo.setting_utils import _as_bool_setting, normalize_setting_list
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
@@ -21,13 +24,11 @@ from pr_agent.log import get_logger
 _STANDARD_PR_COMMANDS = (
     "/describe --pr_description.final_update_message=false",
     "/review",
-    "/improve",
 )
-_PLAIN_PR_COMMANDS = ("/describe", "/review", "/improve")
+_PLAIN_PR_COMMANDS = ("/describe", "/review")
 _COMMITTABLE_PR_COMMANDS = (
     "/describe --pr_description.final_update_message=false",
-    "/review",
-    "/improve --pr_code_suggestions.committable_code_suggestions=true",
+    "/review --pr_code_suggestions.committable_code_suggestions=true",
 )
 _DEFAULT_PR_COMMANDS_BY_PROVIDER = {
     "github_app": _STANDARD_PR_COMMANDS,
@@ -53,6 +54,81 @@ def get_include_pr_labels() -> list[str]:
     return [str(label) for label in value] if isinstance(value, (list, tuple, set)) else [str(value)]
 
 
+def pin_host_settings_source_for_webhook() -> bool:
+    """Remember the trusted source before an earlier host load can change its URL."""
+    if not context.exists():
+        # Background work without an isolated request must not modify global settings.
+        return False
+    if context.get("automatic_host_settings_source"):
+        return True
+    source = get_settings().get("CONFIG.EXTRA_CONFIG_URL")
+    if not isinstance(source, str):
+        if source is not None and source is not False:
+            context["invalid_host_settings_source"] = True
+        return False
+    if not source.strip():
+        return False
+
+    # Some webhook entry points create a request context without preloading
+    # settings. Never merge external host TOML into process-wide settings.
+    if context.get("settings") is None:
+        context["settings"] = copy.deepcopy(get_settings(use_context=False))
+    # Remember the selected trusted source even when its first read fails.
+    context["automatic_host_settings_source"] = source.strip()
+    return True
+
+
+async def load_host_settings_for_webhook() -> bool:
+    """Apply the trusted external host layer before automatic webhook exclusions."""
+    if context.exists() and context.get("automatic_host_settings_source"):
+        return True
+    if not pin_host_settings_source_for_webhook():
+        return False
+
+    from pr_agent.git_providers.utils import apply_host_settings
+
+    try:
+        await asyncio.to_thread(apply_host_settings)
+    except Exception as error:
+        # An invalid/unreachable external source must not stop approval revocation.
+        # Freeze the failure too, so later repository loads do not hit the same
+        # malformed source again or unexpectedly turn a skipped event into an error.
+        if context.exists():
+            source = context.get("automatic_host_settings_source")
+            if source:
+                context.setdefault("extra_config_payloads", {})[source] = None
+        get_logger().warning(f"Unable to preload Host settings for webhook ({type(error).__name__})")
+    return True
+
+
+def host_settings_unavailable() -> bool:
+    """Return True when this webhook's host settings source was pinned but could not be loaded.
+
+    Call it after ``load_host_settings_for_webhook()``. A failed load leaves ``None`` for the
+    source in the request's payload cache; a source that was never loaded is not a failure.
+    """
+    if not context.exists():
+        return False
+    if context.get("invalid_host_settings_source"):
+        return True
+    source = context.get("automatic_host_settings_source")
+    payloads = context.get("extra_config_payloads") or {}
+    return bool(source) and source in payloads and payloads[source] is None
+
+
+async def preload_host_settings_for_new_automatic_event() -> bool:
+    """Preload the external Host source before repository settings for automatic events."""
+    source = get_settings().get("CONFIG.EXTRA_CONFIG_URL")
+    if source is None or source is False:
+        return True
+    if not isinstance(source, str):
+        get_logger().warning("Request ignored: invalid Host settings source")
+        return False
+    if not source.strip():
+        return True
+    return await load_host_settings_for_webhook() and not host_settings_unavailable()
+
+
 def payload_log_summary(data: object, identifying_fields: Sequence[str] = ()) -> dict:
     """Return a webhook payload's top-level keys and identifying string fields, never its values."""
     if not isinstance(data, dict):
@@ -72,7 +148,7 @@ def is_command_comment(body) -> bool:
     A command comment must start with '/' after leading whitespace, matching the
     check the GitHub app and action already apply. Plain sentences that merely
     begin with a command word ("review looks good to me") must not dispatch a
-    tool, because the dispatcher strips an optional leading slash.
+    command, because the dispatcher strips an optional leading slash.
     """
     return isinstance(body, str) and body.lstrip().startswith("/")
 
@@ -85,14 +161,14 @@ def is_ask_command_comment(body) -> bool:
     dispatcher rejects the unknown "/asking" command, but prefix matching would
     instead rewrite the comment into an /ask_line question whose text is
     "ing about retries". "/ask_line" is the generated command name, so it is
-    accepted as well.
+    accepted as well. Recognize aliases and case as the dispatcher does.
     """
     if not isinstance(body, str):
         return False
     stripped = body.lstrip()
     if not stripped:
         return False
-    return stripped.split(maxsplit=1)[0] in ("/ask", "/ask_line")
+    return stripped.split(maxsplit=1)[0].lower() in ("/ask", "/ask_question", "/ask_line")
 
 
 def auto_feedback_disabled() -> bool:
@@ -104,11 +180,58 @@ def auto_feedback_disabled() -> bool:
     )
 
 
+_REVIEW_COMMAND_NAMES = frozenset({"review", "review_pr", "improve", "improve_code"})
+
+
+def _review_command_tokens(command) -> list[str]:
+    """Words of a /review, /improve or /improve_code entry, quoting kept, or [] for anything else.
+
+    An entry the command parser rejects (an unterminated quote, for instance) stays apart
+    instead of swallowing a valid review entry.
+    """
+    if not isinstance(command, str):
+        return []
+    try:
+        tokens = split_command_words(command)
+    except ValueError:
+        return []
+    return tokens if tokens and tokens[0].lstrip("/").lower() in _REVIEW_COMMAND_NAMES else []
+
+
+def dedupe_review_commands(commands: Sequence[str]) -> list[str]:
+    """Rewrite /improve and /improve_code to /review and keep a single /review entry.
+
+    /improve runs /review, so a list naming both would review twice. The first review entry stays in
+    place and takes the arguments of the removed ones, in order, without repeating an identical argument. Other
+    commands, and entries that are not strings, pass through untouched and in order.
+    """
+    result: list = []
+    review_tokens: list[str] | None = None
+    review_index = -1
+    for command in commands:
+        tokens = _review_command_tokens(command)
+        if not tokens:
+            result.append(command)
+            continue
+        if review_tokens is None:
+            slash = "/" if tokens[0].startswith("/") else ""
+            review_tokens = [f"{slash}review", *tokens[1:]]
+            review_index = len(result)
+            result.append(command)
+            continue
+        review_tokens.extend(token for token in tokens[1:] if token not in review_tokens[1:])
+    if review_tokens is not None:
+        result[review_index] = " ".join(review_tokens)
+    return result
+
+
 def get_pr_commands(provider: str) -> Sequence[str]:
     """Return an explicit provider override or a fresh copy of its default profile."""
     configured = get_settings().get(f"{provider}.pr_commands", _MISSING)
     if configured is not _MISSING:
-        return normalize_setting_list(configured) if isinstance(configured, str) else configured
+        if isinstance(configured, str):
+            configured = normalize_setting_list(configured)
+        return dedupe_review_commands(configured) if configured else configured
     return list(_DEFAULT_PR_COMMANDS_BY_PROVIDER[provider])
 
 
@@ -154,8 +277,8 @@ class DefaultDictWithTimeout(defaultdict):
 
     def __init__(
         self,
-        default_factory: Callable[[], Any] = None,
-        ttl: int = None,
+        default_factory: Callable[[], Any] | None = None,
+        ttl: int | None = None,
         refresh_interval: int = 60,
         update_key_time_on_get: bool = True,
         *args,
@@ -245,7 +368,7 @@ def _get_push_trigger_state(key: str, ttl: int | None) -> _PushTriggerState:
 
 
 @asynccontextmanager
-async def push_trigger_slot(key: str, *, allow_backlog: bool, ttl: int | None) -> AsyncIterator[bool]:
+async def push_trigger_slot(key: str, *, allow_backlog: bool, ttl: int | None) -> AsyncGenerator[bool, None]:
     """Run one push per PR, optionally keeping one delegate for subsequent pushes.
 
     State is process-local. TTL bounds idle cache retention; active runs and
@@ -304,7 +427,13 @@ def _extract_pr_metadata(data: dict, provider: str | None = None):
         if not obj_attr or not isinstance(obj_attr, dict):
             return None
         title = obj_attr.get("title") or ""
-        sender = data.get("user", {}).get("username") or ""
+        actor = data.get("user") or {}
+        if not isinstance(actor, dict):
+            actor = {}
+        sender = actor.get("username") or ""
+        # The actor on an MR update is not necessarily the MR author.
+        if obj_attr.get("author_id") is not None and str(obj_attr["author_id"]) != str(actor.get("id")):
+            sender = ""
         repo_full_name = data.get("project", {}).get("path_with_namespace") or ""
         source_branch = obj_attr.get("source_branch") or ""
         target_branch = obj_attr.get("target_branch") or ""
@@ -326,9 +455,10 @@ def _extract_pr_metadata(data: dict, provider: str | None = None):
         source_branch = pr_data.get("source", {}).get("branch", {}).get("name") or ""
         target_branch = pr_data.get("destination", {}).get("branch", {}).get("name") or ""
         repo_full_name = pr_data.get("destination", {}).get("repository", {}).get("full_name") or ""
-        actor = data.get("data", {}).get("actor") or data.get("actor") or {}
-        if isinstance(actor, dict):
-            sender = actor.get("username") or actor.get("display_name") or actor.get("nickname") or ""
+        # The event actor can be a collaborator who pushed to someone else's PR.
+        author = pr_data.get("author") or {}
+        if isinstance(author, dict):
+            sender = author.get("username") or author.get("display_name") or author.get("nickname") or ""
         return title, sender, repo_full_name, labels, source_branch, target_branch
 
     # 3. Bitbucket Server payload
@@ -363,7 +493,9 @@ def _extract_pr_metadata(data: dict, provider: str | None = None):
             for label in pr_labels
             if label
         ]
-        sender = data.get("sender", {}).get("login") or ""
+        # The webhook sender may be a collaborator instead of the PR author.
+        pr_author = pull_request.get("user") or {}
+        sender = (pr_author.get("login") or "") if isinstance(pr_author, dict) else ""
         repo_full_name = data.get("repository", {}).get("full_name") or ""
         return title, sender, repo_full_name, labels, source_branch, target_branch
 

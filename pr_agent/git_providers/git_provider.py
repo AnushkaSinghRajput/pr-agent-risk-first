@@ -1,5 +1,5 @@
 import base64
-import json
+import hashlib
 import os
 import re
 import shutil
@@ -17,13 +17,13 @@ from starlette_context import context
 
 from pr_agent.algo.comment_identity import (
     PRCommandNoticeIdentity,
+    PRDescriptionHeader,
     add_pr_review_identity,
     comment_carries_other_identity,
     comment_matches_identity,
     render_hidden_marker,
 )
 from pr_agent.algo.i18n import t
-from pr_agent.algo.inline_comment_dedup import strip_markers
 from pr_agent.algo.language_handler import build_language_file_matcher, numeric_languages
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.algo.utils import process_description
@@ -72,10 +72,17 @@ def format_persistent_update_notice(name: str, comment_url: str, commit: str) ->
 
 MAX_FILES_ALLOWED_FULL = 50
 
-DEFAULT_DISCUSSION_CONTEXT_CHARS = 24000
 DISCUSSION_CONTEXT_MAX_REPLIES = 10
-DISCUSSION_CONTEXT_MAX_THREADS = 50
 DISCUSSION_CONTEXT_MAX_MESSAGE_CHARS = 750
+
+# The /describe sections GitProvider.limit_description_characters drops, in this order, and the note it ends a
+# body with when it still has to cut the text.
+_DESCRIBE_USAGE_GUIDE = "<details> <summary><strong>✨ Describe command usage guide:</strong></summary><hr>"
+_FILE_WALKTHROUGH_OPENERS = tuple(
+    f"<details{status}> <summary><h3> {PRDescriptionHeader.FILE_WALKTHROUGH.value}</h3></summary>"
+    for status in ("", " open")
+)
+_DESCRIPTION_TRUNCATED = " ... (description truncated due to length limit)"
 
 
 @dataclass
@@ -99,15 +106,6 @@ class CodeSuggestionThread:
         """Return the replies that have a non-blank text message, stripped."""
         return [(author, message.strip()) for author, message in self.replies
                 if isinstance(message, str) and message.strip()]
-
-
-def _discussion_context_budget() -> int:
-    value = get_settings().get("pr_code_suggestions.max_discussion_context_chars", DEFAULT_DISCUSSION_CONTEXT_CHARS)
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        get_logger().warning(f"Invalid pr_code_suggestions.max_discussion_context_chars: {value!r}")
-        return DEFAULT_DISCUSSION_CONTEXT_CHARS
 
 
 class IncompleteProviderPullRequestFilesError(RuntimeError):
@@ -386,8 +384,8 @@ def _is_line_number(value) -> bool:
 
 
 class GitProvider(ABC):
-    # Keep manual-tool reuse opt-in because providers can retain PR revision state.
-    reuse_for_manual_tool = False
+    # Keep manual-command reuse opt-in because providers can retain PR revision state.
+    reuse_for_manual_command = False
 
     def get_request_policy_metadata(self, required_fields: set[str]) -> dict:
         """Return policy fields; None means unknown, empty values mean not applicable.
@@ -413,20 +411,18 @@ class GitProvider(ABC):
         for GitHub; the semantics live here so every provider inherits them. Drop the
         latest commit URL too, so the next command can see newly pushed commits.
         """
-        self._tool_provider_stale = True
+        self._command_provider_stale = True
         self.diff_files = None
         self._latest_commit_url = None
         if getattr(self, "incremental", None) is not None:
             self.incremental = IncrementalPR(False)
+        if hasattr(self, "_incremental_unfiltered_files"):
+            self._incremental_unfiltered_files = None
+        if hasattr(self, "unreviewed_rename_sources"):
+            self.unreviewed_rename_sources = []
         if context.exists():
             context.pop("diff_files", None)
 
-    def supports_incremental_kind(self, kind: str) -> bool:
-        """Whether `get_incremental_commits()` can scope an incremental run to `kind`
-        (e.g. "suggestions" for `/improve -i`). Providers implementing kind-aware
-        incremental anchoring override this; the default is no support, so tools
-        fall back to a full run."""
-        return False
 
     def supports_code_suggestions_artifact(self) -> bool:
         """Return whether `publish_code_suggestions()` writes a standalone output artifact."""
@@ -453,48 +449,10 @@ class GitProvider(ABC):
         """
         return self.publish_code_suggestions(code_suggestions)
 
-    def supports_code_suggestion_state(self) -> bool:
-        return False
-
-    def get_code_suggestion_thread_context(self) -> str:
-        """Return prior code-suggestion threads as a JSON block for the /improve prompt.
-
-        Threads come newest first from `_iter_code_suggestion_threads()`. The block stays within
-        `pr_code_suggestions.max_discussion_context_chars` (0 disables it) and is empty when no thread fits.
-        """
-        budget = _discussion_context_budget()
-        if budget <= 0:
-            return ""
-        discussions = []
-        # Reserve two characters for the outer JSON array brackets.
-        context_chars = 2
-        for thread in self._iter_code_suggestion_threads():
-            if thread.authored_by_agent is False:
-                continue
-            replies = thread.text_replies()
-            discussion = {
-                "thread_id": thread.thread_id,
-                "status": thread.status,
-                "file": thread.file,
-                "start_line": thread.start_line,
-                "end_line": thread.end_line,
-                "suggestion": strip_markers(thread.suggestion).strip()[:DISCUSSION_CONTEXT_MAX_MESSAGE_CHARS],
-                "replies": [{"author": author or "Unknown", "message": message[:DISCUSSION_CONTEXT_MAX_MESSAGE_CHARS]}
-                            for author, message in replies[-DISCUSSION_CONTEXT_MAX_REPLIES:]],
-            }
-            discussion_chars = len(json.dumps([discussion], ensure_ascii=False, indent=2)) - 2
-            if context_chars + discussion_chars > budget:
-                break
-            discussions.append(discussion)
-            context_chars += discussion_chars
-            if len(discussions) >= DISCUSSION_CONTEXT_MAX_THREADS:
-                break
-        return json.dumps(discussions, ensure_ascii=False, indent=2) if discussions else ""
 
     def _iter_code_suggestion_threads(self) -> Iterator[CodeSuggestionThread]:
-        """Yield prior code-suggestion threads, newest first. Providers with suggestion state override this.
+        """Yield review threads, newest first. Providers with thread state override this.
 
-        Inline /review key-issue threads carry the same dedup marker, so a provider may yield them too;
         /review reads them to learn which findings a human resolved."""
         return iter(())
 
@@ -502,7 +460,6 @@ class GitProvider(ABC):
         """Yield review threads with eligible dismissals reported as `resolved`.
 
         Default to the existing iterator so GitLab and unsupported providers keep their behavior.
-        Providers may override this without expanding the /improve discussion context.
         """
         return self._iter_code_suggestion_threads()
 
@@ -516,21 +473,18 @@ class GitProvider(ABC):
         """Whether a published comment renders command checkboxes as checkboxes.
 
         Providers that render `- [ ]` as a tickable box override this; the default is no
-        support, so tools render commands as text instead."""
+        support, so commands render commands as text instead."""
         return False
 
-    def supports_pr_chat(self) -> bool:
-        """Whether this provider is compatible with the linked PR-Agent browser-extension chat experience."""
-        return False
 
     @classmethod
     def supports_issue_indexing(cls) -> bool:
         """Whether `/similar_issue` can read and index this provider's issues.
 
-        Declared on the class rather than on an instance because the tool consults it before
+        Declared on the class rather than on an instance because the command consults it before
         constructing a provider: `PRSimilarIssue` needs to know whether to build one at all.
         The indexing path relies on issue listing, issue bodies and issue comments, so a
-        provider that exposes those overrides this; the default is no support, so the tool
+        provider that exposes those overrides this; the default is no support, so the command
         reports the command as unsupported instead of failing part-way through.
         """
         return False
@@ -556,7 +510,7 @@ class GitProvider(ABC):
     def supports_markdown_tables(self) -> bool:
         """Whether comments render pipe-table markdown.
 
-        Only consulted for providers without `gfm_markdown`, so that tools can degrade to
+        Only consulted for providers without `gfm_markdown`, so that commands can degrade to
         a plain table instead of refusing to render. Providers that render Markdown tables
         but not GitHub-flavored markdown override this."""
         return False
@@ -694,6 +648,10 @@ class GitProvider(ABC):
         """
         return self.get_files()
 
+    def get_verdict_diff_files(self) -> list | None:
+        """Return full, unfiltered diff details when a provider can guarantee completeness."""
+        return None
+
     @abstractmethod
     def get_diff_files(self) -> list[FilePatchInfo]:
         pass
@@ -704,6 +662,12 @@ class GitProvider(ABC):
 
     def get_incremental_commits(self, is_incremental) -> None:
         return None
+
+    def get_pr_commits(self) -> list["PRCommit"] | None:
+        return None
+
+    def set_commit_review_scope(self, commit: "PRCommit", incremental: "IncrementalPR") -> str | None:
+        raise NotImplementedError
 
     @abstractmethod
     def publish_description(self, pr_title: str, pr_body: str) -> None:
@@ -855,6 +819,13 @@ class GitProvider(ABC):
         headers = iter(self._iter_description_headers(description))
         start_position = next((end for header, _, end in headers if header == user_description_header), None)
         if start_position is None:
+            leading_text = self._get_text_before_first_header(description)
+            if leading_text:
+                get_logger().info("Existing description was generated by the pr-agent without a user "
+                                  "description header; keeping the text above the first section",
+                                  description=leading_text)
+                self.user_description = leading_text
+                return leading_text
             get_logger().info("Existing description was generated by the pr-agent, "
                               "but it doesn't contain a user description")
             return ""
@@ -928,6 +899,31 @@ class GitProvider(ABC):
         "### **pr labels**",
         "### \U0001f916 generated by pr agent",
     ))
+
+    # Rich-text editors rewrite the hidden marker and "___" separators, so match loosely.
+    _GENERATED_MARKER_LINE = re.compile(r"<!--\s*pr-agent-generated\s*-->", re.IGNORECASE)
+    _SEPARATOR_LINE = re.compile(r"_{3,}|-{3,}|\*{3,}")
+
+    def _get_text_before_first_header(self, description: str) -> str:
+        """Return author text left above the first pr-agent section after its header was removed."""
+        first_header = next(iter(self._iter_description_headers(description)), None)
+        # Marker mode interleaves "Generated by" sections with the user's template; text above
+        # the first one is a template fragment, and republishing it would drop the rest.
+        if first_header is None or first_header[0].startswith("### 🤖 generated by "):
+            return ""
+        lines = description[:first_header[1]].split("\n")
+
+        def is_edge(line: str) -> bool:
+            stripped = line.strip()
+            return (not stripped or bool(self._SEPARATOR_LINE.fullmatch(stripped))
+                    or bool(self._GENERATED_MARKER_LINE.fullmatch(stripped)))
+
+        start, end = 0, len(lines)
+        while start < end and is_edge(lines[start]):
+            start += 1
+        while end > start and is_edge(lines[end - 1]):
+            end -= 1
+        return "\n".join(lines[start:end]).strip()
 
     def _is_generated_by_pr_agent(self, description_lowercase: str) -> bool:
         # Keep the hidden marker as an unconditional anywhere fast path.
@@ -1045,6 +1041,33 @@ class GitProvider(ABC):
             normalize(value.strip().strip("/")) for value in allowed if isinstance(value, str) and value.strip()
         }
 
+    def is_sibling_namespace_allowed(self, sibling_namespace: str, owning_namespace: str | None,
+                                     *, case_sensitive: bool = True) -> bool:
+        """Approve the namespace a sibling repository resolved into.
+
+        The reviewed repository's own org/group/workspace is always approved, which is the
+        only thing allowed by default: config.repo_context_sibling_namespaces is empty, so
+        this keeps the owning-namespace bound exactly as it was. A host that spreads one
+        project's dependencies over several groups (a submodule in a shared library group,
+        say) names the extra ones there.
+
+        This widens only which namespaces an already-approved repo_context_sibling_repos
+        entry may resolve into; it never makes a repository selectable on its own, and the
+        requester's read access is still checked separately. Host-only, like the repository
+        allowlist it accompanies: repository settings and comment arguments cannot set it.
+        """
+        if not sibling_namespace:
+            return False
+        normalize = (lambda value: value) if case_sensitive else str.casefold
+        if owning_namespace and normalize(sibling_namespace) == normalize(owning_namespace):
+            return True
+        allowed = get_settings().config.get("repo_context_sibling_namespaces", [])
+        if not isinstance(allowed, list):
+            return False
+        return normalize(sibling_namespace) in {
+            normalize(value.strip().strip("/")) for value in allowed if isinstance(value, str) and value.strip()
+        }
+
     def set_command_actor(self, actor) -> None:
         """Record the authenticated user who triggered the current command.
 
@@ -1090,14 +1113,11 @@ class GitProvider(ABC):
     def publish_comment(self, pr_comment: str, is_temporary: bool = False):
         pass
 
-    def publish_tool_failure(self, tool: str, message: str):
-        """Report that `tool` ("describe", "improve") failed. Providers with per-tool outputs override this."""
+    def publish_command_failure(self, command: str, message: str):
+        """Report that `command` ("describe", "improve") failed. Providers with per-command outputs override this."""
         return self.publish_comment(message)
 
     def should_publish_review_as_thread(self) -> bool:
-        return False
-
-    def should_publish_improve_as_thread(self) -> bool:
         return False
 
     def supports_html_comment_markers(self) -> bool:
@@ -1410,7 +1430,10 @@ class GitProvider(ABC):
             "head_sha": self.get_pr_head_sha() or "",
         }
 
-    def auto_approve(self) -> bool:
+    def auto_approve(self, body: str = "") -> bool:
+        return False
+
+    def revoke_auto_approval(self, reason: str) -> bool:
         return False
 
     def get_head_ci_status(self, sha: str | None = None) -> str | None:
@@ -1452,6 +1475,39 @@ class GitProvider(ABC):
         suffix = "..."
         suffix = suffix[:max_chars]
         return output[:max_chars - len(suffix)] + suffix
+
+    def limit_title_characters(self, title: str, max_chars: int) -> str:
+        """Fit a /describe title into the platform's title limit of max_chars characters."""
+        if len(title) <= max_chars:
+            return title
+        get_logger().warning(
+            f"PR title of {len(title)} characters is over the limit of "
+            f"{max_chars}; truncated"
+        )
+        suffix = "..."
+        return title[:max_chars - len(suffix)] + suffix
+
+    def limit_description_characters(self, pr_body: str, max_chars: int) -> str:
+        """Fit a /describe body into the platform's description limit of max_chars characters.
+
+        Drop the usage guide first, then the file walkthrough and what follows it, and cut the text
+        only when it is still too long.
+        """
+        if len(pr_body) <= max_chars:
+            return pr_body
+        full_length = len(pr_body)
+        usage_guide_start = pr_body.rfind(_DESCRIBE_USAGE_GUIDE)
+        if usage_guide_start != -1:
+            pr_body = pr_body[:usage_guide_start]
+        if len(pr_body) > max_chars:
+            walkthrough_start = max(pr_body.rfind(opener) for opener in _FILE_WALKTHROUGH_OPENERS)
+            if walkthrough_start != -1:
+                pr_body = pr_body[:walkthrough_start]
+        if len(pr_body) > max_chars:
+            pr_body = pr_body[:max_chars - len(_DESCRIPTION_TRUNCATED)] + _DESCRIPTION_TRUNCATED
+        get_logger().warning(f"PR description of {full_length} characters is over the limit of {max_chars}; "
+                             f"publishing {len(pr_body)}")
+        return pr_body
 
 
 def get_main_pr_language(languages, files) -> str:
@@ -1540,12 +1596,31 @@ def get_main_pr_language(languages, files) -> str:
 
 
 
+@dataclass(frozen=True)
+class PRCommit:
+    sha: str
+    message: str
+    url: str = ""
+    parents: tuple[str, ...] | None = None
+
+
+_HUNK_LINE_NUMBERS_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.MULTILINE)
+
+
+def commit_patch_fingerprint(files: Iterable[tuple[str, str]]) -> str:
+    digest = hashlib.sha256()
+    for name, patch in sorted((name, _HUNK_LINE_NUMBERS_RE.sub("@@", patch)) for name, patch in files):
+        digest.update(f"{name}\0{patch}\0".encode())
+    return digest.hexdigest()
+
+
 class IncrementalPR:
     def __init__(self, is_incremental: bool = False):
         self.is_incremental = is_incremental
         self.commits_range = None
         self.first_new_commit = None
         self.last_seen_commit = None
+        self.head_sha = None
 
     @property
     def first_new_commit_sha(self):

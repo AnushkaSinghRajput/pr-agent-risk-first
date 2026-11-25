@@ -6,7 +6,7 @@ import pytest
 
 from pr_agent.algo.comment_identity import PRReviewHeader
 from pr_agent.algo.utils import _expand_minute_suffix, convert_to_markdown_v2
-from pr_agent.tools.pr_description import insert_br_after_x_chars
+from pr_agent.commands.pr_description import insert_br_after_x_chars
 
 """
 Code Analysis
@@ -191,6 +191,44 @@ class TestConvertToMarkdown:
         output = convert_to_markdown_v2(input_data)
 
         assert '<strong></strong><br>The function needs review.' in output
+
+    @pytest.mark.parametrize("gfm", [True, False])
+    def test_summary_shows_fix_for_findings_left_in_summary(self, gfm):
+        issue = {
+            'relevant_file': 'src/utils.py',
+            'issue_header': 'Code Smell',
+            'issue_content': 'The function is too long.',
+            'start_line': 30,
+            'end_line': 50,
+            'improved_code': 'x = 1\n```\nprint(x)',
+        }
+        input_data = {'review': {'key_issues_to_review': [issue]}}
+
+        output = convert_to_markdown_v2(input_data, gfm_supported=gfm)
+
+        fix_block = "````text\nx = 1\n```\nprint(x)\n````"
+        assert fix_block in output
+        assert output.index('The function is too long.') < output.index(fix_block)
+        assert ('<details><summary>Suggested fix</summary>' in output) is gfm
+        assert ('**Suggested fix**' in output) is not gfm
+
+    @pytest.mark.parametrize("gfm,expected", [
+        (True, "<strong>Code Smell</strong><br>The function is too long.\n\n"),
+        (False, "**Code Smell**\n\nThe function is too long.\n\n\n\n"),
+    ])
+    def test_summary_without_fix_renders_unchanged(self, gfm, expected):
+        issue = {
+            'relevant_file': 'src/utils.py',
+            'issue_header': 'Code Smell',
+            'issue_content': 'The function is too long.',
+            'improved_code': '   ',
+        }
+        output = convert_to_markdown_v2({'review': {'key_issues_to_review': [issue]}}, gfm_supported=gfm)
+        del issue['improved_code']
+        baseline = convert_to_markdown_v2({'review': {'key_issues_to_review': [issue]}}, gfm_supported=gfm)
+
+        assert expected in output
+        assert output == baseline
 
     def test_ticket_compliance(self):
         input_data = {'review': {
@@ -516,8 +554,11 @@ class TestConvertToMarkdown:
         )
         mode = {"what": "Partial write", "where": "app.py:save", "trigger": "Write fails",
                 "detected_by": "Write failure test", "covered_in_this_pr": False}
-        markdown = convert_to_markdown_v2({"review": {"failure_modes": [mode] * 4}}, gfm_supported=gfm_supported)
+        modes = [{**mode, "what": f"Partial write {index}"} for index in range(1, 5)]
+        markdown = convert_to_markdown_v2({"review": {"failure_modes": modes}}, gfm_supported=gfm_supported)
         assert markdown.count("Partial write") == 3
+        assert all(f"Partial write {index}" in markdown for index in range(1, 4))
+        assert "Partial write 4" not in markdown
 
     # Tests that the function works correctly with an empty dictionary input
     def test_empty_dictionary_input(self):
@@ -569,11 +610,28 @@ class TestBR:
         file_change_description_br = insert_br_after_x_chars(file_change_description)
         assert file_change_description_br == (
             "Created a new class <code>ColorPaletteResourcesCollection</code> which "
-            "extends <br><code>AvaloniaDictionary<ThemeVariant, ColorPaletteResources>"
+            "extends <br><code>AvaloniaDictionary&lt;ThemeVariant, ColorPaletteResources&gt;"
             "</code> and implements <br>aaa"
         )
         # print("-----")
         # print(file_change_description_br)
+
+    def test_br_escapes_html_in_long_descriptions(self):
+        # GitHub drops unknown tags such as <User> from the walkthrough table, so they must be escaped.
+        file_change_description = (
+            "Changed the parser to return `Optional<User>` instead of raising when "
+            "the user record is missing from the cache"
+        )
+        file_change_description_br = insert_br_after_x_chars(file_change_description)
+        assert "<code>Optional&lt;User&gt;</code>" in file_change_description_br
+        assert "<User>" not in file_change_description_br
+
+    def test_br_escapes_html_in_short_descriptions(self):
+        file_change_description = "Return `Optional<User>` <img src=x.png>"
+        file_change_description_br = insert_br_after_x_chars(file_change_description)
+        assert file_change_description_br == (
+            "Return <code>Optional&lt;User&gt;</code> &lt;img src=x.png&gt;"
+        )
 
 
 class TestExpandMinuteSuffix:

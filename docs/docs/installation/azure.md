@@ -54,14 +54,13 @@ stages:
 
         pr-agent --pr_url="$PR_URL" describe
         pr-agent --pr_url="$PR_URL" review
-        pr-agent --pr_url="$PR_URL" improve
       env:
         azure_devops__pat: $(azure_devops_pat)
         openai__key: $(OPENAI_KEY)
       displayName: 'Run PR-Agent'
 ```
 
-This script will run PR-Agent on every new merge request, with the `improve`, `review`, and `describe` commands.
+This script will run PR-Agent on every new merge request, with the `review` and `describe` commands.
 Note that you need to add the `azure_devops_pat` and `OPENAI_KEY` variables to the `pr_agent` variable group in the Azure DevOps pipeline settings (Pipelines -> Library -> + Variable group). The pipeline maps `azure_devops_pat` to the `azure_devops__pat` environment variable:
 
 <img src="/img/azure_devops_pipeline_secrets.png" alt="PR-Agent" width="468" />
@@ -120,6 +119,14 @@ result is posted.
 
 To trigger from an Azure webhook, you need to manually
 [add a webhook](https://learn.microsoft.com/en-us/azure/devops/service-hooks/services/webhooks?view=azure-devops).
+Build the webhook Docker image from the repository root and deploy it:
+
+```bash
+docker build . -t pr-agent:azure_devops_webhook --target azure_devops_webhook -f docker/Dockerfile
+```
+
+Point the webhook at the server's HTTPS root URL (for example, `https://pr-agent.example.com/`);
+the server receives requests at `POST /` and listens on the port set by `PORT` (default `3000`).
 Use the "Pull request created" type to trigger a review, or "Pull request commented on" to trigger a supported
 `/<command> <args>` comment. API v2.0 is required for comment events.
 

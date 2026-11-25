@@ -6,7 +6,7 @@ sidebar_position: 10
 ## Show possible configurations
 
 The possible configurations of PR-Agent are stored in <a href="https://github.com/the-pr-agent/pr-agent/blob/main/pr_agent/settings/configuration.toml" target="_blank" rel="noopener noreferrer">here</a>.
-In the [tools](../tools/index.md) page you can find explanations on how to use these configurations for each tool.
+In the [commands](../commands/index.md) page you can find explanations on how to use these configurations for each command.
 
 To print all the available configurations as a comment on your PR, you can use the following command:
 
@@ -16,7 +16,7 @@ To print all the available configurations as a comment on your PR, you can use t
 
 <img src="/img/possible_config1.png" alt="possible_config1" width="512" />
 
-To view the **actual** configurations used for a specific tool after all user settings are applied,
+To view the **actual** configurations used for a specific command after all user settings are applied,
 an authorized operator can set `config.output_relevant_configurations=true` in `.pr_agent.toml`.
 Comment-supplied arguments cannot enable this output because it may disclose host-controlled settings.
 
@@ -38,7 +38,7 @@ API-cost collection is a separate, default-off option controlled by `config.outp
 
 `config.output_run_details` remains the public-output gate: setting only `config.output_run_cost=true` collects run-level cost data but never adds it to a PR comment.
 
-On providers that support GitHub-Flavored Markdown this appends a collapsible section to the generated comment; elsewhere the same information is appended as plain text (except for `/improve`, see the notes below):
+On providers that support GitHub-Flavored Markdown this appends a collapsible section to the generated comment; elsewhere the same information is appended as plain text:
 
 ```
 ⚙️ Agent run details
@@ -60,7 +60,6 @@ The amount is an estimate based on LiteLLM's pricing data, not provider-invoice-
 Notes:
 
 - `/ask`, `/ask_line`, and `/help <question>` append the section to the published answer. `/update_changelog` appends it to its comment only; the content committed to `CHANGELOG.md` and the review comment that points at it never include it, so a push whose review succeeds shows no section. Messages that need no AI call, such as the static `/help` walkthrough or an `/ask_line` question that matches no diff lines, carry no section.
-- `/improve` appends the section to summary comments and "no suggestions" results. Runs that publish suggestions only as inline comments do not add it. Local and plain-diff providers write artifacts instead of inline comments; their "no suggestions" artifacts can include run details too.
 - With `pr_description.use_description_markers=true`, repeated `/describe` runs accumulate one run details block per run because the existing PR description is preserved and only the markers are replaced.
 
 ## Ignoring files from analysis
@@ -111,14 +110,14 @@ The limit applies separately to `ignore.glob` and each enabled `ignore_language_
 
 ## Extra instructions
 
-All PR-Agent tools have a parameter called `extra_instructions` that adds free-text instructions. Example usage:
+All PR-Agent commands have a parameter called `extra_instructions` that adds free-text instructions. Example usage:
 
 ```
 /update_changelog --pr_update_changelog.extra_instructions="Make sure to update also the version ..."
 ```
 
-Repository settings and command arguments can replace `extra_instructions` for a tool. For mandatory
-organization-wide guidance that must apply to every tool, host operators can set `config.system_instructions`:
+Repository settings and command arguments can replace `extra_instructions` for a command. For mandatory
+organization-wide guidance that must apply to every command, host operators can set `config.system_instructions`:
 
 ```toml
 [config]
@@ -128,11 +127,37 @@ Follow the organization's security and privacy policies.
 """
 ```
 
-PR-Agent appends this value to each tool's own system prompt, after the tool-specific instructions. It is
+PR-Agent appends this value to each command's own system prompt, after the command-specific instructions. It is
 host-only: repository settings, namespace settings repositories, per-directory settings, and
 `/command --config.system_instructions=...` arguments cannot set or replace it.
 `extra_instructions` retains its existing behavior; use `system_instructions` when a rule must not be
 overridable by a repository or comment author.
+
+## Custom comment footer
+
+`extra_instructions` and `system_instructions` guide the model; they do not insert fixed text. To add the same
+literal text to the bot's output in every repository, for example how to opt out or where to send feedback, host
+operators can set `config.custom_comment_footer` (Markdown):
+
+```toml
+[config]
+custom_comment_footer = """
+To disable PR-Agent on this PR, add the label `no-pr-agent`.
+For feedback on the AI results, open a ticket in the internal tracker.
+"""
+```
+
+PR-Agent adds the text after a horizontal rule at the end of the result of `/review` (and `/improve`, which runs
+`/review`), `/describe`, `/ask`, `/ask_line`, `/help`, `/help_docs`, `/update_changelog`, `/config`,
+`/similar_issue`, and the labels comment `/generate_labels` posts on providers without label support. When
+`/describe` updates the PR description rather than posting a comment, the footer becomes part of the PR
+description. Progress, temporary and failure notices are left unchanged, and so are inline code suggestions
+(posted one per line, so a footer would repeat on every suggestion). If a `/review` comment and its persistent
+review state do not fit the provider's comment size limit together with the footer, the footer is omitted so the
+review is not cut short.
+
+The setting is host-only: repository settings, namespace settings repositories, per-directory settings, and
+`/command --config.custom_comment_footer=...` arguments cannot set or remove it. An empty value disables it.
 
 ## Language Settings
 
@@ -159,14 +184,56 @@ Generated language guidance applies only while the command runs. Earlier generat
 
 Some text in PR-Agent comments is written by PR-Agent, not by the model: labels, table headers and status lines. PR-Agent translates this text when it ships a catalog for the language of `response_language`. The tag is matched without regard to case or to `-` versus `_`, and region subtags are dropped until a catalog matches: `es-AR` uses the `es` catalog. When no catalog matches, or a catalog has no translation for a text, that text stays in U.S. English.
 
-Catalogs ship for English (`en`) and Spanish (`es`). In the `/review` comment, the intro line, the effort, tests, security and key-issue labels, the resolved-findings section, the persistent-review update lines and the "Preparing review..." message are translated. The agent run details section is translated for every tool. Everything else stays in U.S. English: the review heading (set it with `pr_reviewer.review_heading`), the other `/review` fields (ticket compliance, risk level, failure modes and the other opt-in fields), the review coverage footer, chunk progress, the comments of the other tools and the labels added to the PR. Numbers keep the U.S. format.
+Catalogs ship for the following languages and regional variants:
+
+| Language | Catalog code |
+| --- | --- |
+| Arabic | `ar` |
+| Bengali | `bn` |
+| Chinese, Simplified (China) | `zh-cn` |
+| Chinese, Traditional (Taiwan) | `zh-tw` |
+| Czech | `cs` |
+| Danish | `da` |
+| Dutch | `nl` |
+| English | `en` |
+| Finnish | `fi` |
+| French | `fr` |
+| German | `de` |
+| Hebrew | `he` |
+| Hindi | `hi` |
+| Hungarian | `hu` |
+| Indonesian | `id` |
+| Italian | `it` |
+| Japanese | `ja` |
+| Korean | `ko` |
+| Persian | `fa` |
+| Polish | `pl` |
+| Portuguese (Brazil) | `pt-br` |
+| Portuguese (Portugal) | `pt-pt` |
+| Romanian | `ro` |
+| Russian | `ru` |
+| Spanish | `es` |
+| Swedish | `sv` |
+| Thai | `th` |
+| Turkish | `tr` |
+| Ukrainian | `uk` |
+| Vietnamese | `vi` |
+
+The 28 new catalogs were drafted and cross-checked with multiple frontier LLMs and an automated code-review
+harness. The Chinese catalogs (`zh-cn` and `zh-tw`) also received human review by the contributor.
+The other 26 catalogs were machine-drafted and AI-reviewed, but have not undergone native-speaker human review.
+Corrections from native speakers are welcome.
+
+Use `zh-CN` or `zh-TW` for Chinese, and `pt-BR` or `pt-PT` for Portuguese. There is no shared `zh` or `pt` catalog. Chinese and Mandarin script tags (`zh-Hans`, `zh-Hant`, `cmn-Hans`, `cmn-Hant`, and the extended `zh-cmn` forms) fall back to the corresponding `zh-cn` and `zh-tw` catalogs, including tags with other regions (for example, `zh-Hant-HK`). Other Chinese varieties without a shipped catalog (such as `zh-yue`) and the tag `zh` alone still fall back to English.
+
+In the `/review` comment, the intro line, the effort, tests, security and key-issue labels, the resolved-findings section, the finding lifecycle summary, the suggested-fix label, the persistent-review update lines and the "Preparing review..." message are translated. `/improve` and `/improve_code` now run `/review`; their one-line notice is also translated. The agent run details section is translated for every command. Other fixed text stays in U.S. English: the review heading (set it with `pr_reviewer.review_heading`), the other `/review` fields (ticket compliance, risk level, failure modes and the other opt-in fields), the review coverage footer, chunk progress, other commands' comments outside their run details, and the labels added to the PR. Numbers keep the U.S. format.
 
 To add a language, copy `pr_agent/settings/i18n/en.toml` to a file named after the language code, such as `pt.toml` or `pt-br.toml`, and translate its values. Keep each `{placeholder}` unchanged.
 
 [//]: # (## Working with large PRs)
 
 [//]: # ()
-[//]: # (The default mode of CodiumAI is to have a single call per tool, using GPT-4, which has a token limit of 8000 tokens.)
+[//]: # (The default mode of CodiumAI is to have a single call per command, using GPT-4, which has a token limit of 8000 tokens.)
 
 [//]: # (This mode provides a very good speed-quality-cost tradeoff, and can handle most PRs successfully.)
 
@@ -175,9 +242,9 @@ To add a language, copy `pr_agent/settings/i18n/en.toml` to a file named after t
 [//]: # ()
 [//]: # (However, for very large PRs, or in case you want to emphasize quality over speed and cost, there are two possible solutions:)
 
-[//]: # (1&#41; [Use a model]&#40;./changing_a_model.md&#41; with larger context, like GPT-32K, or claude-100K. This solution will be applicable for all the tools.)
+[//]: # (1&#41; [Use a model]&#40;./changing_a_model.md&#41; with larger context, like GPT-32K, or claude-100K. This solution will be applicable for all the commands.)
 
-[//]: # (2&#41; For the `/improve` tool, there is an ['extended' mode]&#40;../tools/improve.md&#41; &#40;`/improve --extended`&#41;,)
+[//]: # (2&#41; For the `/improve` command, there is an ['extended' mode]&#40;../commands/improve.md&#41; &#40;`/improve --extended`&#41;,)
 
 [//]: # (which divides the PR into chunks, and processes each chunk separately. With this mode, regardless of the model, no compression will be done &#40;but for large PRs, multiple model calls may occur&#41;)
 
@@ -230,18 +297,7 @@ still uses `/ask_line` and its existing reply behavior. If the ID is unavailable
 falls back to a normal note so output is not lost. GitHub Conversation comments do not expose a compatible
 reply endpoint.
 
-With `persistent_comment=true` (the default for both tools), a rerun updates the earlier result where it was first posted, which may be a different discussion; `/review` also posts a short link to it in the new command's discussion.
-
-## Post the /improve suggestions as a GitLab thread
-
-By default, PR-Agent posts the `/improve` suggestions as a plain note. To post them as a resolvable thread (GitLab discussion) instead, enable (default: `false`):
-
-```toml
-[gitlab]
-publish_improve_as_thread = true
-```
-
-- A run that finds no suggestions edits the thread in place and resolves it, so a status message does not leave an open thread behind.
+With `persistent_comment=true` (the default for both commands), a rerun updates the earlier result where it was first posted, which may be a different discussion; `/review` also posts a short link to it in the new command's discussion.
 
 ## Resolve outdated GitLab inline threads
 
@@ -318,6 +374,13 @@ The value is derived from the PR URL and normalized to the character set LiteLLM
 for example `pr-agent-github-com-owner-repo-pull-123-b065a0b1d1c7b721`. A header set explicitly through
 `LITELLM.EXTRA_HEADERS` takes precedence, and the setting is disabled by default.
 
+The same value is passed to LiteLLM as `litellm_session_id`, which LiteLLM forwards as the
+provider's session header where one exists, such as OpenCode Go's required `x-opencode-session`.
+The value includes the PR's host and repository path, so enabling the setting sends them to that provider.
+
+Requests without a PR, such as the `doctor` model ping and the MOSAICO health probe, use a random
+`pr-agent-<uuid>` value generated once per process instead.
+
 ## Integrating with Logging Observability Platforms
 
 Various logging observability tools can be used out-of-the box when using the default LiteLLM AI Handler. Simply configure the LiteLLM callback settings in `configuration.toml` and set environment variables according to the LiteLLM [documentation](https://docs.litellm.ai/docs/).
@@ -374,7 +437,13 @@ failure_callback = ["otel"]
 turn_off_message_logging = true
 ```
 
-> **Set `turn_off_message_logging = true`.** LiteLLM attaches full prompt and response content to what its callbacks emit, which here means the entire PR diff. The default is `false` to preserve existing behavior for Langfuse and LangSmith users.
+> **Set `turn_off_message_logging = true`.** LiteLLM attaches full prompt and response content to what its
+> callbacks emit, which here means the entire PR diff. This also suppresses PR-Agent's own full prompt/response
+> diagnostics in the LiteLLM and OpenAI handlers, even at `DEBUG` log level or verbosity level 2. It does not sanitize
+> unrelated application logs or third-party callback errors. The default is `false` to preserve existing
+> behavior for Langfuse and LangSmith users. A deployment-level opt-out cannot be disabled by repository
+> settings. Unpublished CLI commands with verbosity level 2 still print model responses to stdout, which
+> may be captured separately; treat that explicit output as sensitive.
 
 The integration is configured through environment variables:
 
@@ -417,7 +486,7 @@ callback_timeout_seconds = 30 # default
 
 ## Built-in OpenTelemetry command telemetry
 
-PR-Agent can emit its own [OpenTelemetry](https://opentelemetry.io/) signals for utilization and adoption tracking. These cover the **command** layer — how often each tool runs, on which git provider, whether it succeeded, and how many tokens it consumes — which no LLM-level integration can report, because many failures happen before any model call:
+PR-Agent can emit its own [OpenTelemetry](https://opentelemetry.io/) signals for utilization and adoption tracking. These cover the **command** layer — how often each command runs, on which git provider, whether it succeeded, and how many tokens it consumes — which no LLM-level integration can report, because many failures happen before any model call:
 
 - **Traces**: one span per request, named `pr_agent <command>` (for example `pr_agent review`), carrying `pr_agent.command`, `pr_agent.args_count`, `vcs.provider.name`, a span status, and a bounded `error.type` on failure. Prompt and response content is never attached.
 - **Metrics**: `pr_agent.commands`, a counter of executed commands labeled by command and git provider. `pr_agent.tokens` counts consumed tokens, labeled by command, git provider, `pr_agent.fallback_used` (true or false), and `gen_ai.token.type` (`input`, `output`, `cache_read`, or `cache_creation`). `pr_agent.ai_calls` counts successful model calls, labeled by command, git provider, and `pr_agent.fallback_used`. Zero values are skipped, so providers that do not report usage add no token timeseries (`pr_agent.ai_calls` still counts their calls).
@@ -469,8 +538,16 @@ prometheus_multiproc_dir = "/tmp/pr-agent-prometheus" # shared, writable by ever
 
 1. The exporter is metrics-only: command spans are not exported in this mode.
 2. `/metrics` is mounted only when this exporter is selected, so nothing is exposed by default. It does not depend on an OTLP collector or endpoint.
-3. gunicorn registers and deregisters workers' state files automatically (`when_ready`/`child_exit`); a worker that dies mid-scrape leaves only a stale file, which is ignored once it is marked dead.
-4. Metric families are created from the first data point's label set. Later attributes that do not fit the family are dropped, and missing ones are back-filled with an empty string, so a scrape never breaks on drifting label cardinality.
+3. gunicorn prepares the multiprocess state directory at `when_ready` and calls `mark_process_dead` from `child_exit`. The client removes live-gauge files, but retains counter and default-gauge files; retained values remain visible until the directory is cleared or replaced.
+4. With OpenTelemetry SDK 1.45.2, each metric stream tracks up to 2,000 distinct attribute sets by default; measurements for additional sets go into an overflow point. PR-Agent's synchronous DELTA counters start tracking attribute sets again after each collection, while exported Prometheus counters continue accumulating. The built-in counters use bounded labels; high-cardinality custom metrics using the same provider can reach this limit.
+
+   Normal series use the first normal data point's label set. Later attributes that do not fit are dropped, and missing ones are back-filled with an empty string. Overflow points use `otel_metric_overflow="true"`; normal attribute values still use their usual string representation, including `True` for a boolean. Normal labels whose Prometheus text output is `otel_metric_overflow` or starts with `pr_agent_escaped_` receive the prefix `pr_agent_escaped_`, including names containing `:` that the client renders as `_`. Update queries that use those labels.
+
+   Different attribute names that map to the same label can still collide. Prometheus treats an empty label value as equivalent to an absent label, including across workers. An attribute set identical to the SDK's `otel.metric.overflow = true` marker cannot be distinguished from overflow.
+
+   Gauge values, including overflow points, can remain visible after the SDK stops reporting them. This exporter does not currently expire stale gauge series.
+
+   Use the same exporter version across workers sharing a multiprocess state directory: older workers and their retained state files can still collide with overflow series when their final label values match, including through `:` label escaping. For example, an old normal boolean value `True` stays distinct from the new overflow value `true`, but an old string value `true` can collide. Stop all workers using the state directory before clearing it, or switch to a fresh directory as part of a coordinated worker restart; replacing the directory resets the stored counters. Even with a new directory, an old normal series and a new overflow series with the same metric name and labels share Prometheus history across the upgrade.
 5. The exporter ships with PR-Agent (it depends on `prometheus-client`); no extra package is required. Scrape it like any exporter:
 
    ```yaml
@@ -500,10 +577,12 @@ Notes:
 
 `Platforms supported: GitHub, GitLab, Gitea, Bitbucket, Azure DevOps, Local`
 
-To give PR-Agent's tools additional project context, you can have it include repository instruction files — such as [AGENTS.md](https://agents.md/) or [CLAUDE.md](https://www.anthropic.com/engineering/claude-code-best-practices) — in the prompts for the `/review`, `/describe`, `/improve`, and top-level `/ask` tools.
+To give PR-Agent's commands additional project context, you can have it include repository instruction files — such as [AGENTS.md](https://agents.md/) or [CLAUDE.md](https://www.anthropic.com/engineering/claude-code-best-practices) — in the prompts for the `/review`, `/describe`, `/improve`, `/ask`, `/ask_line`, and `/add_docs` commands.
 
-Top-level `/ask` adds instructions only after selecting the question's existing context and diff, and reports when the instruction block does not fit.
-See [Ask: Repository instructions](../tools/ask.md#repository-instructions).
+Both Ask modes add instructions only after fitting their existing question, diff, and history context, and report when the instruction block does not fit.
+See [Ask: Repository instructions](../commands/ask.md#repository-instructions).
+
+The `/add_docs` command uses configured local repository files by default; structured sibling-repository entries are excluded because generated documentation suggestions may be published. Set `pr_add_docs.use_repo_context = false` to opt out for that command.
 
 By default, PR-Agent includes the `AGENTS.md` file at the repository root:
 
@@ -512,14 +591,12 @@ By default, PR-Agent includes the `AGENTS.md` file at the repository root:
 repo_context_files = ["AGENTS.md"]
 ```
 
-A nested list is a group of alternatives: only the first one that yields content is used. This is opt-in, for repositories that keep the same instructions under several conventions (or symlink them) and want them sent once:
+A nested list is a group of repository-relative path alternatives: only the first one that yields content is used. This is opt-in, for repositories that keep the same instructions under several conventions (or symlink them) and want them sent once:
 
 ```toml
 [config]
 repo_context_files = [["AGENTS.md", "CLAUDE.md", ".kiro/steering/*.md"]]
 ```
-
-A nested list is a group of alternatives: only the first one that yields content is used, so a repository that keeps the same instructions under several conventions (or symlinks one file to another) sends them once. Alternatives must be repository-relative paths.
 
 You can list any repository-relative paths. By default the files are read from the repository's **default branch**, so only trusted, already-merged content is used and a PR cannot influence the guidance used to review it. A file that is missing is silently skipped. For example, to include several files:
 
@@ -617,8 +694,25 @@ PR-Agent allows you to automatically ignore certain PRs based on various criteri
 The title, author, label, repository, source-branch, and target-branch `ignore_*` rules also apply to
 comment commands such as `/review` and `/ask`, and to CLI `--pr_url` runs. In these paths,
 `ignore_pr_authors` matches the **PR author**, not the person posting the command. An ignored CLI
-request exits successfully without running the tool. Plain-diff CLI inputs (`--diff-file` and
+request exits successfully without running the command. Plain-diff CLI inputs (`--diff-file` and
 `--stdin`) have no PR metadata and are not excluded by these rules.
+
+For automatic PR/MR webhooks in GitHub App, GitLab, Gitea, and Bitbucket Cloud,
+host exclusions are evaluated before repository settings.
+A repository cannot clear a host exclusion already matched at this stage; it can still
+exclude additional requests. Manual commands and CLI runs use their effective repository policy.
+
+An automatic webhook may now read `CONFIG.EXTRA_CONFIG_URL` even when the host policy
+rejects the event, adding a configuration fetch that would previously have been skipped.
+On these webhooks, `ignore_pr_authors` checks the PR/MR author rather than the event actor;
+unavailable author metadata retains the existing best-effort policy behavior.
+GitLab may also make an extra MR-author API request for relevant events when Host author
+filtering is enabled and the event actor differs from the MR author.
+
+For GitHub App webhooks, `github_app.override_deployment_type` defaults to `true`
+to preserve App authentication after trusted external Host settings are loaded.
+Trusted Host settings may set it to `false` to retain their configured deployment
+type; repository settings cannot control this option.
 
 For GitHub Actions, matching PRs also skip automatic review, description, and improve commands
 on `pull_request`, `pull_request_target`, and `workflow_run` events.
@@ -725,7 +819,7 @@ ignore_pr_authors = ["my-special-bot-user", ...]
 Where the `ignore_pr_authors` is a regex list of usernames that you want to ignore.
 
 :::note
-The GitHub App does not currently trigger tools in response to failed `check_run` webhook events.
+The GitHub App does not currently trigger commands in response to failed `check_run` webhook events.
 :::
 
 ## Ignoring Generated Files by Language/Framework
@@ -749,7 +843,7 @@ When running PR-Agent with limited GitHub/GitLab permissions, set `restricted_mo
 restricted_mode = true
 ```
 
-For the default tools in GitHub Actions, use:
+For the default commands in GitHub Actions, use:
 
 ```yaml
 permissions:

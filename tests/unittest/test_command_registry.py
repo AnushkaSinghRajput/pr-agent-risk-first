@@ -3,7 +3,7 @@
 The registry is the one place where command spellings, aliases, and the
 per-command facts the entry points need live. These tests pin the refactor:
 the registry must cover exactly the dispatched commands, aliases must share
-their canonical command's tool and check run, and an automatic ``/review_pr``
+their canonical command's command and check run, and an automatic ``/review_pr``
 must open and complete the ``review`` check run like ``/review`` does.
 """
 
@@ -23,11 +23,11 @@ from pr_agent.agent.command_registry import (
 from pr_agent.agent.pr_agent import command2class, commands
 from pr_agent.cli import (
     _JSON_DESCRIBE_COMMANDS,
-    _JSON_IMPROVE_COMMANDS,
     _JSON_LABEL_COMMANDS,
     _JSON_REVIEW_COMMANDS,
     _PLAIN_DIFF_MARKDOWN_COMMANDS,
 )
+from pr_agent.commands.pr_reviewer import PRReviewer
 from pr_agent.config_loader import get_settings
 from pr_agent.servers import github_app
 
@@ -36,7 +36,7 @@ def test_registry_covers_exactly_the_dispatched_commands():
     assert set(COMMAND_SPECS) == set(command2class)
     assert set(COMMAND_SPECS) == set(commands)
     for name, spec in COMMAND_SPECS.items():
-        assert spec.tool is command2class[name]
+        assert spec.command is command2class[name]
 
 
 @pytest.mark.parametrize(
@@ -50,7 +50,7 @@ def test_registry_covers_exactly_the_dispatched_commands():
     ],
 )
 def test_aliases_share_their_canonical_command(alias, canonical):
-    assert resolve_command(alias).tool is resolve_command(canonical).tool
+    assert resolve_command(alias).command is resolve_command(canonical).command
 
 
 @pytest.mark.parametrize(
@@ -62,8 +62,8 @@ def test_aliases_share_their_canonical_command(alias, canonical):
         ("/REVIEW_PR", "review"),
         ("/describe", "describe"),
         ("/describe_pr", "describe"),
-        ("/improve", "suggestions"),
-        ("/improve_code", "suggestions"),
+        ("/improve", "review"),
+        ("/improve_code", "review"),
         ("/ask", None),
         ("/help", None),
         ("/unknown_command", None),
@@ -101,10 +101,25 @@ def test_cli_command_sets_match_the_registry():
         "ask", "ask_question",
         "config", "settings", "help",
     }
-    assert _JSON_REVIEW_COMMANDS == {"review", "review_pr"}
-    assert _JSON_IMPROVE_COMMANDS == {"improve", "improve_code"}
+    assert _JSON_REVIEW_COMMANDS == {"review", "review_pr", "improve", "improve_code"}
     assert _JSON_DESCRIBE_COMMANDS == {"describe", "describe_pr"}
     assert _JSON_LABEL_COMMANDS == {"generate_labels"}
+
+
+@pytest.mark.parametrize("name", ["improve", "improve_code"])
+def test_improve_resolves_to_review_spec(name):
+    spec = resolve_command(name)
+    review = resolve_command("review")
+
+    assert spec.command is PRReviewer
+    assert spec.check_run == review.check_run == "review"
+    assert spec.json_output == review.json_output == "review"
+    assert command2class[name] is PRReviewer
+
+
+def test_no_suggestions_check_run_for_improve():
+    assert "suggestions" not in {spec.check_run for spec in COMMAND_SPECS.values()}
+    assert github_app._auto_command_check_run("/improve")[1] == "review"
 
 
 @pytest.mark.parametrize("name", ["answer", "auto_review"])

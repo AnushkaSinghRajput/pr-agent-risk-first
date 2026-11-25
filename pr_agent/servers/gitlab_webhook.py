@@ -20,9 +20,10 @@ from pr_agent.agent.command_registry import command_takes_comment_id
 from pr_agent.agent.pr_agent import PRAgent, prepare_command
 from pr_agent.agent.request_policy import RequestOutcome
 from pr_agent.algo.run_details import command_failed, init_run_details
-from pr_agent.algo.setting_utils import _as_bool_setting, normalize_setting_list
-from pr_agent.config_loader import get_settings, global_settings
-from pr_agent.git_providers import get_git_provider_with_context
+from pr_agent.algo.setting_utils import _as_bool_setting, _as_ssl_verify_setting, normalize_setting_list
+from pr_agent.algo.utils import encode_user_text_arg
+from pr_agent.config_loader import get_bot_display_name, get_settings, global_settings
+from pr_agent.git_providers import get_git_provider, get_git_provider_with_context
 from pr_agent.git_providers.request_timeout import get_http_request_timeout, refresh_session_request_timeout
 from pr_agent.git_providers.utils import apply_host_settings, apply_repo_settings
 from pr_agent.log import LoggingFormat, get_logger, setup_logger
@@ -31,11 +32,15 @@ from pr_agent.servers import lambda_handoff
 from pr_agent.servers.request_body_limit import create_server_app
 from pr_agent.servers.utils import (
     auto_feedback_disabled,
+    dedupe_review_commands,
     get_include_pr_labels,
     get_pr_commands,
+    host_settings_unavailable,
     is_ask_command_comment,
     is_command_comment,
+    load_host_settings_for_webhook,
     payload_log_summary,
+    pin_host_settings_source_for_webhook,
     push_trigger_slot,
     shared_should_process_pr_logic,
 )
@@ -100,12 +105,12 @@ async def _perform_commands_gitlab(commands_conf: str, agent: PRAgent, api_url: 
     if auto_feedback_disabled():
         get_logger().info(f"Auto feedback is disabled, skipping auto commands for PR {api_url=}", **log_context)
         return
-    if not should_process_pr_logic(data): # Here we already updated the configurations
+    if not await asyncio.to_thread(should_process_pr_logic, data): # Here we already updated the configurations
         return
     commands = (
         get_pr_commands("gitlab")
         if commands_conf == "pr_commands"
-        else normalize_setting_list(get_settings().get(f"gitlab.{commands_conf}", {}))
+        else dedupe_review_commands(normalize_setting_list(get_settings().get(f"gitlab.{commands_conf}", {})))
     )
     get_settings().set("config.is_auto_command", True)
     for command in commands:
@@ -130,6 +135,8 @@ def is_bot_user(data) -> bool:
     try:
         # logic to ignore bot users (unlike GitHub, no direct flag for bot users in gitlab)
         user = data.get("user") or {}
+        if not isinstance(user, dict):
+            user = {}
         # gitlab.ignore_user_ids may arrive as a list, a single int (GITLAB__IGNORE_USER_IDS=123)
         # or a string, including a comma-separated one (GITLAB__IGNORE_USER_IDS=123,456),
         # so split commas and compare every entry as a stripped string.
@@ -220,9 +227,7 @@ async def _get_bot_user_id():
     def _resolve_sync():
         import gitlab
 
-        ssl_verify = get_settings().get("GITLAB.SSL_VERIFY", True)
-        if isinstance(ssl_verify, str) and ssl_verify.lower() in ("true", "false"):
-            ssl_verify = ssl_verify.lower() == "true"
+        ssl_verify = _as_ssl_verify_setting(get_settings().get("GITLAB.SSL_VERIFY", True))
 
         auth_method = get_settings().get("GITLAB.AUTH_TYPE", "oauth_token")
         if auth_method not in ("oauth_token", "private_token"):
@@ -268,12 +273,16 @@ async def is_bot_assigned_as_reviewer(data) -> bool:
         if "reviewers" not in changes:
             return False
         reviewers_change = changes["reviewers"]
-        if not isinstance(reviewers_change, dict):
+        if isinstance(reviewers_change, dict):
+            previous = reviewers_change.get("previous")
+            current = reviewers_change.get("current")
+        elif (isinstance(reviewers_change, list) and len(reviewers_change) == 2
+              and all(isinstance(reviewers, list) for reviewers in reviewers_change)):
+            previous, current = reviewers_change
+        else:
             return False
-        previous = reviewers_change.get("previous")
         if not isinstance(previous, list):
             previous = []
-        current = reviewers_change.get("current")
         if not isinstance(current, list):
             current = []
         bot_user_id = await _get_bot_user_id()
@@ -281,13 +290,44 @@ async def is_bot_assigned_as_reviewer(data) -> bool:
             return False
         previous_ids = {r.get("id") for r in previous if isinstance(r, dict)}
         current_ids = {r.get("id") for r in current if isinstance(r, dict)}
-        return bot_user_id in current_ids and bot_user_id not in previous_ids
+        if bot_user_id in current_ids and bot_user_id not in previous_ids:
+            return True
+        return (any(r.get("id") == bot_user_id and r.get("re_requested") is False
+                    for r in previous if isinstance(r, dict))
+                and any(r.get("id") == bot_user_id and r.get("re_requested") is True
+                        for r in current if isinstance(r, dict)))
     except Exception as e:
         get_logger().error(f"Failed 'is_bot_assigned_as_reviewer' logic: {e}")
     return False
 
 def should_process_pr_logic(data) -> bool:
-    return shared_should_process_pr_logic(data, provider="gitlab")
+    """Use the MR author for effective repository exclusions, not the update actor."""
+    author = None
+    attributes = data.get("object_attributes") if isinstance(data, dict) else None
+    actor = data.get("user") if isinstance(data, dict) else None
+    if not isinstance(actor, dict):
+        actor = {}
+    if (
+        isinstance(attributes, dict)
+        and attributes.get("author_id") is not None
+        and str(attributes["author_id"]) != str(actor.get("id"))
+        and get_settings().get("CONFIG.IGNORE_PR_AUTHORS")
+    ):
+        # An unknown author must not fall back to the webhook actor. Keep
+        # unavailable author metadata best-effort, as with the host prefilter.
+        author = ""
+        if attributes.get("url"):
+            try:
+                # This post-settings path reuses the provider loaded by apply_repo_settings.
+                metadata = get_git_provider_with_context(
+                    pr_url=attributes["url"]
+                ).get_request_policy_metadata({"sender"})
+                author = metadata.get("sender") or ""
+            except Exception as error:
+                get_logger().warning(
+                    f"Unable to resolve GitLab MR author for repository exclusion ({type(error).__name__})"
+                )
+    return shared_should_process_pr_logic(data, provider="gitlab", sender=author)
 
 
 def _is_merge_request_not_found(error: Exception) -> bool:
@@ -354,7 +394,14 @@ async def authenticate_gitlab_webhook(request: Request, log_context: dict):
             return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED,
                                 content=jsonable_encoder({"message": "unauthorized"}))
     if not get_settings().get("GITLAB.PERSONAL_ACCESS_TOKEN", None):
-        await asyncio.to_thread(apply_host_settings)
+        # The webhook credential has been verified. Classify the event before
+        # choosing strict frozen loading; manual notes retain best-effort loading.
+        try:
+            event_data = await request.json()
+        except ValueError:
+            # Preserve the missing-API-token rejection for malformed JSON bodies.
+            event_data = {}
+        await _load_gitlab_host_credentials(event_data)
     gitlab_token = get_settings().get("GITLAB.PERSONAL_ACCESS_TOKEN", None)
     if not gitlab_token:
         get_logger().error("No gitlab token found")
@@ -364,7 +411,15 @@ async def authenticate_gitlab_webhook(request: Request, log_context: dict):
     return None
 
 
-async def restore_gitlab_handoff_auth(auth: dict | None, log_context: dict):
+async def _load_gitlab_host_credentials(data: dict):
+    """Use frozen Host settings only for automatic merge-request events."""
+    if isinstance(data, dict) and data.get("object_kind") == "merge_request":
+        # Pin before a successful Host load can change EXTRA_CONFIG_URL.
+        pin_host_settings_source_for_webhook()
+    await asyncio.to_thread(apply_host_settings)
+
+
+async def restore_gitlab_handoff_auth(auth: dict | None, log_context: dict, *, body: dict):
     """Restore API credentials for an IAM-authorized, already authenticated hand-off."""
     if not isinstance(auth, dict) or "secret_name" not in auth:
         raise ValueError("Missing GitLab hand-off authentication outcome")
@@ -387,7 +442,7 @@ async def restore_gitlab_handoff_auth(auth: dict | None, log_context: dict):
         context["authenticated_provider_settings"] = {"gitlab.personal_access_token": gitlab_token}
         log_context["token_id"] = secret_dict.get("token_name", secret_dict.get("id", "unknown"))
     if not get_settings().get("GITLAB.PERSONAL_ACCESS_TOKEN", None):
-        await asyncio.to_thread(apply_host_settings)
+        await _load_gitlab_host_credentials(body)
     if not get_settings().get("GITLAB.PERSONAL_ACCESS_TOKEN", None):
         raise RuntimeError("No GitLab API credential available for the hand-off")
 
@@ -417,6 +472,48 @@ async def gitlab_webhook(background_tasks: BackgroundTasks, request: Request):
     return JSONResponse(status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "success"}))
 
 
+def revoke_auto_approval_on_push(data: dict) -> None:
+    """Dismiss PR-Agent's approval when a push or retarget changes what it approved.
+
+    A retarget is an update with no ``oldrev``; only code changes carry one. Call this
+    before any filter that may skip the event: an approval must not outlive what it was
+    given for just because the push came from a bot or the MR is ignored.
+    """
+    if data.get("object_kind") != "merge_request":
+        return
+    object_attributes = data.get("object_attributes")
+    if not isinstance(object_attributes, dict):
+        return
+    if object_attributes.get("action") != "update":
+        return
+    if object_attributes.get("oldrev"):
+        why = "new commits were pushed"
+    elif isinstance(data.get("changes"), dict) and "target_branch" in data["changes"]:
+        why = "the target branch changed"
+    else:
+        return
+    mr_url = object_attributes.get("url")
+    # The gates are host-only, so read them after the trusted host layer and before any repository override.
+    try:
+        apply_host_settings()
+    except Exception as e:
+        get_logger().warning(f"Could not apply host settings before approval revocation: {type(e).__name__}")
+    config = get_settings().config
+    if not mr_url or not _as_bool_setting(
+            config.get("enable_auto_approval", False), setting_name="config.enable_auto_approval"):
+        return
+    # A dry run writes nothing, dismissals included.
+    if not _as_bool_setting(config.get("publish_output", True), default=True):
+        return
+    try:
+        if not get_git_provider_with_context(mr_url).revoke_auto_approval(
+            f"{get_bot_display_name()} withdrew its approval: {why}."
+        ):
+            get_logger().error(f"Could not confirm that PR-Agent's approvals were dismissed after: {why}")
+    except Exception as e:
+        get_logger().exception(f"Failed to dismiss PR-Agent approvals after: {why}, error: {e}")
+
+
 async def process_gitlab_event(data: dict, log_context: dict):
     """Process a verified GitLab webhook payload to completion.
 
@@ -424,8 +521,23 @@ async def process_gitlab_event(data: dict, log_context: dict):
     directly in the second Lambda invocation when the webhook was handed off.
     """
     get_logger().info("GitLab data", artifact=payload_log_summary(data, ("object_kind",)))
-    sender = data.get("user", {}).get("username", "unknown")
-    sender_id = data.get("user", {}).get("id", "unknown")
+    if data.get("object_kind") != "merge_request" and context.exists():
+        # Manual commands must not inherit a frozen automatic Host source.
+        context.pop("automatic_host_settings_source", None)
+    try:
+        if data.get("object_kind") == "merge_request":
+            attributes = data.get("object_attributes")
+            changes = data.get("changes")
+            if (isinstance(attributes, dict) and attributes.get("action") == "update"
+                    and (attributes.get("oldrev") or (isinstance(changes, dict) and "target_branch" in changes))):
+                await load_host_settings_for_webhook()
+    finally:
+        revoke_auto_approval_on_push(data)
+    actor = data.get("user") or {}
+    if not isinstance(actor, dict):
+        actor = {}
+    sender = actor.get("username", "unknown")
+    sender_id = actor.get("id", "unknown")
 
     # ignore bot users
     if is_bot_user(data):
@@ -433,10 +545,47 @@ async def process_gitlab_event(data: dict, log_context: dict):
 
     log_context["sender"] = sender
     if data.get('object_kind') == 'merge_request':
-        # ignore MRs based on title, labels, source and target branches
+        attributes = data.get('object_attributes')
+        if not isinstance(attributes, dict) or attributes.get('action') not in ('open', 'reopen', 'update'):
+            return
+        if attributes.get("action") == "update" and not attributes.get("oldrev") and not is_draft_ready(data):
+            changes = data.get("changes")
+            if not isinstance(changes, dict) or "reviewers" not in changes:
+                return
+        await load_host_settings_for_webhook()
+        if host_settings_unavailable():
+            # Fail closed: without the host layer its exclusions would not apply.
+            get_logger().warning("Request ignored: host settings could not be loaded")
+            return
+
+        # GitLab's event user is the actor. When a different user authored the
+        # MR, resolve the author only if a host author exclusion needs it.
+        author_override = None
+        author_id = attributes.get("author_id")
+        if (author_id is not None and str(author_id) != str(actor.get("id"))
+                and get_settings().get("CONFIG.IGNORE_PR_AUTHORS")):
+            author_override = ""
+            pr_url = attributes.get("url")
+            if pr_url:
+                try:
+                    metadata = await asyncio.to_thread(
+                        # Keep this early metadata read out of the request provider cache:
+                        # push commands must load a fresh MR after acquiring their slot.
+                        lambda: get_git_provider()(pr_url).get_request_policy_metadata({"sender"})
+                    )
+                    author_override = metadata.get("sender") or ""
+                except Exception as error:
+                    get_logger().warning(
+                        f"Unable to resolve GitLab MR author for host exclusion ({type(error).__name__})"
+                    )
+
+        # Defer the positive label gate; repository settings may supply it.
         prefilter_allowed = (
-            shared_should_process_pr_logic(data, provider="gitlab", check_include_labels=False)
-            if get_include_pr_labels() else should_process_pr_logic(data)
+            shared_should_process_pr_logic(
+                data, provider="gitlab", sender=author_override, check_include_labels=False
+            ) if author_override is not None
+            else (shared_should_process_pr_logic(data, provider="gitlab", check_include_labels=False)
+                  if get_include_pr_labels() else should_process_pr_logic(data))
         )
         if not prefilter_allowed:
             return
@@ -506,7 +655,7 @@ async def process_gitlab_event(data: dict, log_context: dict):
                                     content=jsonable_encoder({"message": "success"}))
 
             # Check PR logic after applying repo settings
-            if not should_process_pr_logic(data):
+            if not await asyncio.to_thread(should_process_pr_logic, data):
                 return JSONResponse(
                     status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "success"}))
 
@@ -533,7 +682,7 @@ async def process_gitlab_event(data: dict, log_context: dict):
             body = data.get('object_attributes', {}).get('note')
             if not is_command_comment(body):
                 # A plain comment whose first word happens to be a command name must not
-                # dispatch a tool: the dispatcher strips an optional leading slash.
+                # dispatch a command: the dispatcher strips an optional leading slash.
                 get_logger().info("Ignoring comment not starting with /")
                 return
             await asyncio.to_thread(apply_host_settings)
@@ -544,8 +693,9 @@ async def process_gitlab_event(data: dict, log_context: dict):
             if (discussion_id and command_takes_comment_id(command) and (
                     not note_type or (note_type == "DiscussionNote" and command in ("/ask", "/ask_question")))):
                 body = f"{body} --comment_id={discussion_id}"
-            if note_type == 'DiffNote' and is_ask_command_comment(body):  # /ask_line
-                body = handle_ask_line(body, data)
+            if note_type == 'DiffNote' and is_ask_command_comment(body):
+                # /ask on a whole file asks about that file; on lines it becomes /ask_line
+                body = handle_file_question(body, data, url) or handle_ask_line(body, data)
 
             # A fresh collector, so the verdict below can only come from this command.
             init_run_details()
@@ -565,7 +715,7 @@ async def process_gitlab_event(data: dict, log_context: dict):
                 url, body, log_context, sender_id, notify=notify_start_reaction)
             if result is RequestOutcome.SKIPPED or not dispatched:
                 return
-            # `propagate_tool_errors` is off, so a tool that failed internally still returns
+            # `propagate_command_errors` is off, so a command that failed internally still returns
             # normally. Reading that as success would tick a comment whose command never ran.
             # `bool()` rather than `result is not False`, so a `None` reads as failure here the
             # same way it does in `pr_reviewer` and the GitHub App
@@ -574,30 +724,83 @@ async def process_gitlab_event(data: dict, log_context: dict):
                 provider.react_to_outcome, comment_id, bool(result) and not command_failed())
 
 
+def handle_file_question(body, data, mr_url):
+    """Turn /ask or /ask_question on a whole file into a question about that file's diff.
+
+    The file and the note's discussion go into the request context, where PRQuestions reads them to
+    answer in that discussion. Returns None for any other note.
+    """
+    attributes = data['object_attributes']
+    position = attributes.get('position')
+    if (not isinstance(position, dict) or position.get('position_type') != 'file'
+            or body.split(maxsplit=1)[0].lower() not in ("/ask", "/ask_question")):
+        return None
+    path = position.get('new_path')
+    discussion_id = attributes.get('discussion_id')
+    note_id = attributes.get('id')
+    if not isinstance(path, str) or not path.strip() or not discussion_id or note_id is None:
+        return None
+    parts = body.strip().split(maxsplit=1)
+    question = parts[1] if len(parts) > 1 else ""
+    context["file_question_path"] = path
+    context["file_question_comment_id"] = discussion_id
+    context["file_question_origin_comment_id"] = note_id
+    context["file_question_comment_url"] = attributes.get('url') or f"{mr_url}#note_{note_id}"
+    # The provider reads the notes before this one in the discussion as its history.
+    return ["/ask", f"--origin_comment_id={note_id}", encode_user_text_arg(question)]
+
+
+def _positive_line_number(value) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _gitlab_endpoint_line(endpoint: dict) -> tuple[int, str] | None:
+    """Resolve one GitLab line_range endpoint to (line_number, side), honoring explicit type."""
+    endpoint_type = endpoint.get("type")
+    old_line = _positive_line_number(endpoint.get("old_line"))
+    new_line = _positive_line_number(endpoint.get("new_line"))
+    if endpoint_type == "old" and old_line is not None:
+        return old_line, "LEFT"
+    if endpoint_type == "new" and new_line is not None:
+        return new_line, "RIGHT"
+    if new_line is not None:
+        return new_line, "RIGHT"
+    if old_line is not None:
+        return old_line, "LEFT"
+    return None
+
+
+def _resolve_gitlab_line_range(position: dict) -> tuple[int, int, str, str] | None:
+    """Resolve a GitLab DiffNote position into (start_line, end_line, start_side, side)."""
+    line_range = position.get("line_range")
+    if isinstance(line_range, dict):
+        start = line_range.get("start") if isinstance(line_range.get("start"), dict) else {}
+        end = line_range.get("end") if isinstance(line_range.get("end"), dict) else {}
+        start_resolved = _gitlab_endpoint_line(start)
+        end_resolved = _gitlab_endpoint_line(end)
+        if start_resolved is not None and end_resolved is not None:
+            return start_resolved[0], end_resolved[0], start_resolved[1], end_resolved[1]
+        if end_resolved is not None:
+            return end_resolved[0], end_resolved[0], end_resolved[1], end_resolved[1]
+
+    new_line = _positive_line_number(position.get("new_line"))
+    if new_line is not None:
+        return new_line, new_line, "RIGHT", "RIGHT"
+    old_line = _positive_line_number(position.get("old_line"))
+    if old_line is not None:
+        return old_line, old_line, "LEFT", "LEFT"
+    return None
+
+
 def handle_ask_line(body, data):
     try:
         position = data['object_attributes']['position']
-        line_range_ = position.get('line_range')
-        if line_range_ is None:
-            new_line = position.get('new_line')
-            old_line = position.get('old_line')
-            if isinstance(new_line, int) and not isinstance(new_line, bool) and new_line > 0:
-                start_line = end_line = new_line
-                side = 'RIGHT'
-            elif isinstance(old_line, int) and not isinstance(old_line, bool) and old_line > 0:
-                start_line = end_line = old_line
-                side = 'LEFT'
-            else:
-                return body
-        elif line_range_['start'].get('type', 'new') == 'old':
-            start_line = line_range_['start']['old_line']
-            end_line = line_range_['end']['old_line']
-            side = 'LEFT'
-        else:
-            start_line = line_range_['start']['new_line']
-            end_line = line_range_['end']['new_line']
-            side = 'RIGHT'
-        question = body.strip().removeprefix('/ask').strip()
+        resolved = _resolve_gitlab_line_range(position)
+        if resolved is None:
+            return body
+        start_line, end_line, start_side, side = resolved
+        parts = body.strip().split(maxsplit=1)
+        question = parts[1] if len(parts) > 1 else ""
         path = position['new_path']
         comment_id = data['object_attributes']["discussion_id"]
         get_logger().info("Handling line ")
@@ -609,6 +812,11 @@ def handle_ask_line(body, data):
             f"--file_name={path}",
             f"--comment_id={comment_id}",
         ]
+        if start_side != side:
+            body.insert(4, f"--start_side={start_side}")
+        origin_comment_id = data['object_attributes'].get('id')
+        if origin_comment_id is not None:
+            body.append(f"--origin_comment_id={origin_comment_id}")
         if question:
             body.append(question)
     except Exception as e:

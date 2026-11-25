@@ -40,14 +40,14 @@ backlog = 2048
 #   worker_class - The type of workers to use. The default
 #       sync class should handle most 'normal' types of work
 #       loads. You'll want to read
-#       http://docs.gunicorn.org/en/latest/design.html#choosing-a-worker-type
+#       https://gunicorn.org/design/#worker-types
 #       for information on when you might want to choose one
 #       of the other worker classes.
 #
 #       A string referring to a Python path to a subclass of
 #       gunicorn.workers.base.Worker. The default provided values
 #       can be seen at
-#       http://docs.gunicorn.org/en/latest/settings.html#worker-class
+#       https://gunicorn.org/reference/settings/#worker_class
 #
 #   worker_connections - For the eventlet and gevent worker classes
 #       this limits the maximum number of simultaneous clients that
@@ -290,12 +290,16 @@ def _prepare_prometheus():
     so the dir must exist (and PROMETHEUS_MULTIPROC_DIR be set) in the master before the
     first worker fork — workers import the client lazily and inherit the env var.
     """
+    from pr_agent.algo.setting_utils import _as_bool_setting
     from pr_agent.config_loader import get_settings
+    from pr_agent.telemetry.config import _normalized_exporter_type
     from pr_agent.telemetry.prometheus_multiproc import ensure_prometheus_multiproc_dir
     from pr_agent.telemetry.types import ExporterType
 
     settings = get_settings()
-    if settings.get("OTEL.IS_ENABLED", False) and settings.get("OTEL.EXPORTER_TYPE") == ExporterType.PROMETHEUS:
+    is_enabled = _as_bool_setting(settings.get("OTEL.IS_ENABLED", False), setting_name="OTEL.IS_ENABLED")
+    exporter_type = _normalized_exporter_type(settings.get("OTEL.EXPORTER_TYPE"))
+    if is_enabled and exporter_type == ExporterType.PROMETHEUS:
         ensure_prometheus_multiproc_dir(str(settings.get("OTEL.PROMETHEUS_MULTIPROC_DIR", "/tmp/pr-agent-prometheus")))
 
 

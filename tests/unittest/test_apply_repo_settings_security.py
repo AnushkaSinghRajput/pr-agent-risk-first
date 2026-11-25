@@ -273,6 +273,41 @@ def test_repo_settings_cannot_set_structural_reach_input_file(monkeypatch, setti
     assert pr_reviewer.get("num_max_findings") == 11
 
 
+def test_repo_settings_cannot_weaken_merge_verdict_risk_limits(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(
+        repo_settings_bytes=(
+            b"[pr_reviewer]\nmax_changed_lines = 9999\nsensitive_paths = []\nnum_max_findings = 11\n"
+        )
+    )
+    _install_provider(monkeypatch, provider)
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set("pr_reviewer.max_changed_lines", 250)
+    settings.set("pr_reviewer.sensitive_paths", ["host-controlled/**"])
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    pr_reviewer = _section(settings, "pr_reviewer")
+    assert pr_reviewer["max_changed_lines"] == 250
+    assert pr_reviewer["sensitive_paths"] == ["host-controlled/**"]
+    assert pr_reviewer["num_max_findings"] == 11
+    assert is_repo_host_only_key("pr_reviewer", "max_changed_lines")
+    assert is_repo_host_only_key("pr_reviewer", "sensitive_paths")
+
+
+def test_repo_settings_cannot_configure_extra_risky_shapes(monkeypatch, settings_snapshot):
+    provider = FakeGitProvider(repo_settings_bytes=b'[pr_reviewer]\nextra_risky_shapes = ["CUSTOM_RISK"]\n')
+    _install_provider(monkeypatch, provider)
+    settings = get_settings()
+    settings.set("config.use_repo_settings_file", True)
+    settings.set("pr_reviewer.extra_risky_shapes", ["HOST_RISK"])
+
+    apply_repo_settings("https://example.com/owner/repo/pull/1")
+
+    assert _section(settings, "pr_reviewer")["extra_risky_shapes"] == ["HOST_RISK"]
+    assert is_repo_host_only_key("pr_reviewer", "extra_risky_shapes")
+
+
 def test_repo_settings_cannot_enable_artifact_findings(monkeypatch, settings_snapshot):
     provider = FakeGitProvider(
         repo_settings_bytes=b"[pr_reviewer]\nrequire_artifact_findings = true\nnum_max_findings = 11\n"
@@ -749,10 +784,6 @@ def test_repo_settings_still_apply_other_litellm_keys(monkeypatch, settings_snap
 def test_nested_provider_connection_keys_are_host_only_for_cli(arg):
     assert CliArgs.validate_user_args([arg])[0] is False
 
-
-def test_progress_gif_url_remains_repo_and_cli_configurable():
-    assert not is_repo_host_only_key("config", "progress_gif_url")
-    assert CliArgs.validate_user_args(["--config.progress_gif_url=https://example.com/progress.gif"])[0] is True
 
 
 def test_repo_settings_apply_only_section_specific_safe_overrides(monkeypatch, settings_snapshot):

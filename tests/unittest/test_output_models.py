@@ -8,8 +8,6 @@ from pydantic import StrictBool, StrictInt
 
 from pr_agent.algo.output_models import (
     CodeDocumentation,
-    CodeSuggestion,
-    CodeSuggestionFeedback,
     ContributionTimeCostEstimate,
     DocHeadingsHelper,
     DocHelper,
@@ -19,13 +17,10 @@ from pr_agent.algo.output_models import (
     KeyIssuesComponentLink,
     Label,
     Labels,
-    PRCodeSuggestions,
-    PRCodeSuggestionsFeedback,
     PRDescription,
     PRDescriptionAssembled,
     PRDescriptionHeaders,
     PRFilesWalkthrough,
-    PRRankResponses,
     PRReview,
     PRType,
     RelevantSection,
@@ -33,6 +28,7 @@ from pr_agent.algo.output_models import (
     SubPR,
     TicketCompliance,
     TodoSection,
+    finding_confidence,
 )
 from pr_agent.algo.utils import load_yaml
 
@@ -70,6 +66,24 @@ def _review_fixture():
     }
 
 
+def test_key_issue_model_accepts_fix_fields():
+    payload = {
+        "relevant_file": "src/app.py",
+        "issue_header": "Possible Bug",
+        "issue_content": "The lock is never released.",
+        "start_line": 4,
+        "end_line": 5,
+    }
+
+    plain = KeyIssuesComponentLink.model_validate(payload)
+    fixed = KeyIssuesComponentLink.model_validate(
+        {**payload, "existing_code": "lock.acquire()", "improved_code": "with lock: ..."}
+    )
+
+    assert (plain.existing_code, plain.improved_code) == (None, None)
+    assert (fixed.existing_code, fixed.improved_code) == ("lock.acquire()", "with lock: ...")
+
+
 def test_review_model_does_not_expose_user_answer_insights():
     assert "insights_from_user_answers" not in Review.model_fields
 
@@ -84,21 +98,6 @@ def test_review_model_does_not_expose_user_answer_insights():
         (ContributionTimeCostEstimate, {"best_case": "45m", "average_case": "2h", "worst_case": "5h"}),
         (Review, _review_fixture()["review"]),
         (PRReview, _review_fixture()),
-        (CodeSuggestion, {
-            "relevant_file": "src/app.py", "language": "python", "existing_code": "return value",
-            "suggestion_content": "Handle the missing value.", "improved_code": "return value or default",
-            "one_sentence_summary": "Handle missing values", "label": "possible bug",
-        }),
-        (PRCodeSuggestions, {"code_suggestions": [{
-            "relevant_file": "src/app.py", "language": "python", "existing_code": "return value",
-            "suggestion_content": "Handle the missing value.", "improved_code": "return value or default",
-            "one_sentence_summary": "Handle missing values", "label": "possible bug",
-        }]}),
-        (PRCodeSuggestionsFeedback, {"code_suggestions": [{
-            "suggestion_summary": "Handle missing values", "relevant_file": "src/app.py",
-            "relevant_lines_start": 10, "relevant_lines_end": 10, "suggestion_score": 8,
-            "why": "The change prevents a runtime failure.",
-        }]}),
         (PRDescription, {"type": ["Bug fix"], "description": "Fix a runtime failure.", "title": "Fix runtime failure",
                          "changes_diagram": "flowchart LR\nA --> B", "pr_files": [{
                              "filename": "src/app.py", "changes_summary": "- Handle failures",
@@ -117,12 +116,6 @@ def test_review_model_does_not_expose_user_answer_insights():
             "relevant file": "src/app.py", "relevant line": 12, "doc placement": "after",
             "documentation": "Document the handler.",
         }]}),
-        (PRRankResponses, {
-            "which_response_was_better": 1,
-            "why": "It is clearer.",
-            "score_response1": 9,
-            "score_response2": 7,
-        }),
         (DocHelper, {"user_question": "How?", "response": "Use the helper.", "relevant_sections": [{
             "file_name": "docs/guide.md", "relevant_section_header_string": "## Usage",
         }], "question_is_relevant": 1}),
@@ -208,27 +201,12 @@ def test_review_accepts_extra_fields_while_nested_schemas_stay_strict():
 
 
 _INVALID_MODEL_PAYLOADS = [
-    (CodeSuggestion, {
-        "relevant_file": "src/app.py", "language": "python", "existing_code": "return value",
-        "suggestion_content": "Handle the missing value.", "improved_code": "return value or default",
-        "one_sentence_summary": "Handle missing values",
-    }),
-    (PRRankResponses, {
-        "which_response_was_better": 3, "why": "No", "score_response1": 1, "score_response2": 1,
-    }),
     (Review, {"key_issues_to_review": [], "can_be_split": [{"relevant_files": [], "title": "x"}] * 4}),
     (PRDescription, {"type": ["Tests"], "title": "x", "pr_files": [{
         "filename": "x", "changes_title": "x", "label": "x",
     }] * 21}),
     (Review, {"key_issues_to_review": [], "estimated_effort_to_review_[1-5]": 0}),
     (Review, {"key_issues_to_review": [], "score": 101}),
-    (PRCodeSuggestionsFeedback, {"code_suggestions": [{
-        "suggestion_summary": "x", "relevant_file": "x", "relevant_lines_start": 1,
-        "relevant_lines_end": 1, "suggestion_score": 11, "why": "x",
-    }]}),
-    (PRRankResponses, {
-        "which_response_was_better": 1, "why": "x", "score_response1": 0, "score_response2": 11,
-    }),
     (DocHelper, {
         "user_question": "x", "response": "x", "relevant_sections": [], "question_is_relevant": 2,
     }),
@@ -423,20 +401,9 @@ PROMPT_MODELS = {
         "FileDescription": FileDescription, "PRFilesWalkthrough": PRFilesWalkthrough,
     },
     "pr_custom_labels.toml": {"Labels": Labels},
-    "pr_evaluate_prompt_response.toml": {"PRRankResponses": PRRankResponses},
     "pr_help_prompts.toml": {"relevant_section": RelevantSection, "DocHelper": DocHelper},
     "pr_help_docs_prompts.toml": {"relevant_section": RelevantSection, "DocHelper": DocHelper},
     "pr_help_docs_headings_prompts.toml": {"file_idx_and_path": FileIdxAndPath, "DocHeadingsHelper": DocHeadingsHelper},
-    "code_suggestions/pr_code_suggestions_prompts.toml": {
-        "CodeSuggestion": CodeSuggestion, "PRCodeSuggestions": PRCodeSuggestions,
-    },
-    "code_suggestions/pr_code_suggestions_prompts_not_decoupled.toml": {
-        "CodeSuggestion": CodeSuggestion, "PRCodeSuggestions": PRCodeSuggestions,
-    },
-    "code_suggestions/pr_code_suggestions_reflect_prompts.toml": {
-        "CodeSuggestionFeedback": CodeSuggestionFeedback,
-        "PRCodeSuggestionsFeedback": PRCodeSuggestionsFeedback,
-    },
 }
 
 
@@ -506,8 +473,31 @@ def test_estimate_effort_example_is_a_strict_integer():
     })
 
 
-def test_ranking_example_is_a_valid_numeric_payload():
-    text = 'which_response_was_better: 1\nwhy: "It is clearer."\nscore_response1: 9\nscore_response2: 7'
-    parsed = load_yaml(text)
-    assert isinstance(parsed["which_response_was_better"], int)
-    PRRankResponses.model_validate(parsed)
+@pytest.mark.parametrize("confidence", [-1, 11, 8.5])
+def test_key_issue_confidence_must_be_an_integer_from_0_to_10(confidence):
+    issue = dict(_review_fixture()["review"]["key_issues_to_review"][0], confidence=confidence)
+
+    with pytest.raises(ValueError):
+        KeyIssuesComponentLink.model_validate(issue)
+
+
+@pytest.mark.parametrize("confidence", [0, 8, 10])
+def test_key_issue_accepts_integer_confidence(confidence):
+    issue = dict(_review_fixture()["review"]["key_issues_to_review"][0], confidence=confidence)
+
+    assert KeyIssuesComponentLink.model_validate(issue).confidence == confidence
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(8, 8.0), (8.5, 8.5), (" 7 ", 7.0), ("8.0", 8.0), (0, 0.0), (10, 10.0),
+     (None, None), (True, None), ("very", None), (-1, None), (15, None), (float("nan"), None),
+     (float("inf"), None), ([8], None)],
+)
+def test_finding_confidence_normalises_one_value_for_filtering_and_rendering(value, expected):
+    assert finding_confidence({"confidence": value}) == expected
+
+
+def test_finding_confidence_of_a_non_finding_is_none():
+    assert finding_confidence("not a dict") is None
+    assert finding_confidence({}) is None

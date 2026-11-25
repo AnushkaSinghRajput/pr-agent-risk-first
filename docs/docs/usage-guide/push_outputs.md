@@ -3,24 +3,24 @@ title: "Push outputs to external sinks"
 sidebar_position: 7
 ---
 
-The `[push_outputs]` feature routes finished tool output to external sinks — stdout, a JSONL file, a
+The `[push_outputs]` feature routes finished command output to external sinks — stdout, a JSONL file, a
 generic webhook, Slack, Telegram, or Microsoft Teams — without calling git-provider APIs. It is disabled by default, and is
-additive to normal publishing: when a tool finishes, its structured result and rendered Markdown
+additive to normal publishing: when a command finishes, its structured result and rendered Markdown
 are also emitted to the configured sinks. An effective `config.publish_output = false` disables both normal publishing
 and these sinks. Plain-diff mode forces publishing on to preserve stdout/file output; set
 `push_outputs.enable = false` in the host configuration to disable its extra sinks.
 
 ## What gets pushed
 
-Each finished tool run that produces output emits one record when publishing and the sinks are enabled.
-The tools that currently emit are:
+Each finished command run that produces output emits one record when publishing and the sinks are enabled.
+The commands that currently emit are:
 
-| Tool | `type` in the record |
+| Command | `type` in the record |
 |---|---|
-| `/review` | `review` |
+| `/review` (and `/improve`, which runs it) | `review` |
 | `/describe` | `describe` |
-| `/improve` | `improve` |
-| `/ask` | `ask` (opt-in with `tools`) |
+| `/ask` | `ask` (opt-in with `commands`) |
+| `/update_changelog` | `update_changelog` (opt-in with `commands`) |
 
 A record is a JSON object:
 
@@ -40,16 +40,16 @@ A record is a JSON object:
 }
 ```
 
-- `type` — which tool produced the output
+- `type` — which command produced the output
 - `timestamp` — the run completion time, UTC, ISO-8601
-- `payload` — the structured tool result
-- `pr` — the tool's pull request identity, present when the calling tool supplies it
+- `payload` — the structured command result
+- `pr` — the command's pull request identity, present when the calling command supplies it
 - `pr.url` — the pull request page URL
 - `pr.provider` — the git provider, such as `github`, `gitlab`, or `bitbucket`
 - `pr.repo` — the repository name or path
 - `pr.number` — the pull request number
 - `pr.head_sha` — the head commit SHA
-- `markdown` — the rendered comment text; present when the tool produces one
+- `markdown` — the rendered comment text; present when the command produces one
 
 For `/describe`, `payload.title` is the selected title, including the original PR title read when the
 command starts if `pr_description.generate_ai_title` is disabled. When the model output contains a
@@ -60,6 +60,11 @@ For `/ask`, `payload.question` is the user's question and `payload.answer` is th
 the note explaining that no changed files could be analyzed). Its Markdown contains the question
 and answer without the PR-only help guide or run-details footer. Inline `/ask_line` replies are not emitted.
 
+For `/update_changelog`, `payload.path` is the selected changelog path and `payload.entry` contains
+only the newly generated Markdown entry, not the full changelog or PR-only commit instructions.
+The sink Markdown labels it as a draft. Delivery precedes publishing to the git provider, so a
+received record does not confirm that a changelog file was committed successfully.
+
 ## Configuration
 
 The defaults are defined at the end of the
@@ -69,7 +74,7 @@ The defaults are defined at the end of the
 [push_outputs]
 enable = false
 channels = []                          # any of: "stdout", "file", "webhook", "slack", "telegram", "teams"
-tools = ["review", "describe", "improve"] # tool types to deliver; opt in to "ask" explicitly
+commands = ["review", "describe"] # opt in to "ask" or "update_changelog" explicitly
 file_path = "pr-agent-outputs/reviews.jsonl"
 webhook_url = ""                       # must be an absolute https:// URL
 slack_webhook_url = ""                 # Slack Incoming Webhook; must be an absolute https:// URL
@@ -80,7 +85,7 @@ teams_webhook_url = ""                 # Teams Workflows webhook URL; must be an
 
 - `enable` — master switch (default `false`). When `false`, nothing is emitted.
 - `channels` — which sinks to use. Use exact registered names as a list/tuple or a comma-separated string; surrounding whitespace is ignored. Nothing is emitted until at least one channel is listed here.
-- `tools` — which tool results to send to those sinks. Defaults to `review`, `describe`, and `improve`, preserving existing delivery. Use a list/tuple or comma-separated string of exact names. Add `ask` to receive answers, or select only the tools of interest. This does not change which commands PR-Agent runs.
+- `commands` — which command results to send to those sinks. Defaults to `review` and `describe`; `/improve` now runs `/review`, so its output arrives as `review`. Use a list/tuple or comma-separated string of exact names. Add `ask` or `update_changelog` to opt in to those results. This does not change which commands PR-Agent runs.
 - `file_path` — the file the `file` channel appends to.
 - `webhook_url` — the endpoint the `webhook` channel POSTs the generic record to.
 - `slack_webhook_url` — a Slack Incoming Webhook URL that the `slack` channel posts a `{"text": ...}` payload to.
@@ -88,9 +93,12 @@ teams_webhook_url = ""                 # Teams Workflows webhook URL; must be an
 - `telegram_chat_id` — the chat that receives Telegram messages.
 - `teams_webhook_url` — a Teams Workflows webhook URL that receives Adaptive Cards from the `teams` channel.
 
-For example, a host can set `tools = ["review", "ask"]` to receive reviews and interactive answers
+For example, a host can set `commands = ["review", "ask"]` to receive reviews and interactive answers
 without sending description or suggestion results. Ask questions and answers may contain private
 information; only enable their delivery to trusted, operator-controlled destinations.
+
+When rolling out `update_changelog` to workers sharing host settings, upgrade all workers before
+adding it to `commands`. Older versions reject unknown command names and skip all sink delivery.
 
 :::danger[Host-only configuration]
 The whole `[push_outputs]` section is **host-only**. A repository cannot set these keys:
@@ -119,13 +127,18 @@ credential.
 | `stdout` | Prints one JSON line (the record) to stdout. |
 | `file` | Appends one JSON line per run (JSONL) to `file_path`, creating parent directories as needed. |
 | `webhook` | POSTs the generic record as JSON to `webhook_url` (5-second timeout, redirects not followed). |
-| `slack` | POSTs `{"text": ...}` to a Slack Incoming Webhook; the text is the markdown, or the payload JSON when the tool produces no markdown, with `&`, `<` and `>` escaped so Slack shows mentions and `<url\|label>` links as plain text, followed by the PR URL when one is present. |
+| `slack` | POSTs `{"text": ...}` to a Slack Incoming Webhook; the text is the markdown, or the payload JSON when the command produces no markdown, with `&`, `<` and `>` escaped so Slack shows mentions and `<url\|label>` links as plain text, followed by the PR URL when one is present. |
 | `telegram` | Sends the markdown, or the payload JSON when no markdown is present, as plain text to `telegram_chat_id`, followed by the PR URL when one is present. Text is truncated to at most 4096 UTF-16 code units without splitting surrogate pairs; room is reserved for the URL so truncation does not drop it. |
-| `teams` | POSTs an Adaptive Card to `teams_webhook_url` with the tool type, markdown output, and a button to the PR when its URL is present. The card is trimmed to Teams' 28 KB message size limit. |
+| `teams` | POSTs an Adaptive Card to `teams_webhook_url` with the command type, markdown output, and a button to the PR when its URL is present. The card is trimmed to Teams' 28 KB message size limit. |
 
 Local channels (`stdout`, `file`) run before network channels (`webhook`, `slack`, `telegram`, `teams`), and network
-posts never follow redirects. Each configured destination is attempted independently, so one failure
-does not prevent later destinations from receiving the output.
+posts never follow redirects. Commands send the built-in network outputs concurrently, with a separate worker pool
+per destination so a slow channel does not prevent healthy channels from delivering. The command still waits for
+every selected delivery to finish before returning, including in AWS Lambda; HTTP requests retain the original
+five-second connection/read timeout. Cancelling a caller does not discard work already being prepared or sent,
+though process termination can still interrupt delivery. When custom strategies or replacements are selected,
+the command uses the original sequential delivery order to preserve their shared record and request context.
+Delivery failures remain non-fatal, but there is no automatic retry or guarantee of delivery after a failed request.
 
 ### Telegram
 
@@ -156,14 +169,14 @@ type or status code, since request error messages can embed the (secret-bearing)
 ## Extending delivery
 
 `push_outputs()` in `pr_agent/algo/run_output.py` builds the record once and isolates failures
-for each selected destination. The tools deliver from an event loop, so they call
-`push_outputs_async()`, which runs the delivery in a worker thread and awaits it: a slow
-destination does not stall the other pull requests the server is handling, and the output
-still reaches the sink before the command returns. Delivery strategies live in
+for each selected destination. Commands call `push_outputs_async()`, which prepares the record
+and writes local outputs in a worker thread, then dispatches built-in network destinations concurrently to
+separate worker pools. Slow or failed HTTP destinations do not block the event loop or other network channels,
+and the command waits for all deliveries to finish before returning. Delivery strategies live in
 `pr_agent/algo/output_sinks.py`: each implements `OutputSink.send(record, cfg)`, and
-`create_output_sink()` selects the strategy from `OUTPUT_SINK_TYPES`. Registry order
-determines delivery order, with local writes first; duplicate channel entries still result
-in a single delivery.
+`create_output_sink()` selects the strategy from `OUTPUT_SINK_TYPES`. Direct synchronous calls, and commands with
+custom strategies, retain registry delivery order; other commands write local outputs first and send built-in
+HTTP outputs concurrently. Duplicate channel entries still result in a single delivery.
 
 To add a destination, implement its strategy and register it, then add any required host-only
 settings, documentation, and provider-specific tests. HTTP strategies must validate destinations

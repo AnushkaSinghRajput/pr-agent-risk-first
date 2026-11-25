@@ -1,4 +1,4 @@
-"""Delivery strategies for host-configured tool output destinations."""
+"""Delivery strategies for host-configured command output destinations."""
 
 from __future__ import annotations
 
@@ -13,11 +13,24 @@ import requests
 from pr_agent.algo.setting_utils import _as_bool_setting, normalize_setting_list
 from pr_agent.log import get_logger
 
+_DEFAULT_OUTPUT_FILE_PATH = "pr-agent-outputs/reviews.jsonl"
+_MARKDOWN_ONLY_SINKS = frozenset({"slack", "telegram", "teams"})
+
 
 class OutputSink(Protocol):
     def send(self, record: dict, cfg: dict) -> None:
         """Deliver one record using host-controlled settings; let the caller isolate failures."""
         pass
+
+
+def _is_https_sink_url(url: object) -> bool:
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and bool(parsed.hostname)
 
 
 def _push_outputs_sink_url(cfg: dict, key: str) -> str:
@@ -76,7 +89,7 @@ class StdoutSink:
 
 class FileSink:
     def send(self, record: dict, cfg: dict) -> None:
-        file_path = cfg.get("file_path", "pr-agent-outputs/reviews.jsonl")
+        file_path = cfg.get("file_path", _DEFAULT_OUTPUT_FILE_PATH)
         folder = os.path.dirname(file_path)
         if folder:
             os.makedirs(folder, exist_ok=True)
@@ -205,16 +218,49 @@ OUTPUT_SINK_TYPES: dict[str, type[OutputSink]] = {
 }
 
 
-def _selected_output_tools(cfg: dict) -> list[str] | None:
+def _selected_output_commands(cfg: dict) -> list[str] | None:
     """Return selected output types, or None for an invalid configuration."""
-    tools = cfg.get("tools", ["review", "describe", "improve"])
-    if isinstance(tools, str):
-        tools = normalize_setting_list(tools, split_commas=True)
-    if (not isinstance(tools, (list, tuple)) or not tools
-            or any(not isinstance(name, str) or name not in ("review", "describe", "improve", "ask")
-                   for name in tools)):
+    commands = cfg.get("commands", ["review", "describe"])
+    if isinstance(commands, str):
+        commands = normalize_setting_list(commands, split_commas=True)
+    if (not isinstance(commands, (list, tuple)) or not commands
+            or any(not isinstance(name, str) or name not in ("review", "describe", "improve", "ask", "update_changelog")
+                   for name in commands)):
         return None
-    return list(tools)
+    return list(commands)
+
+
+def _push_outputs_consumes_payload(cfg: object, message_type: str) -> bool:
+    """Return True if an enabled sink for `message_type` serializes `record["payload"]`."""
+    if not hasattr(cfg, "get"):
+        return False
+    enable = cfg.get("enable", False)
+    if isinstance(enable, str):
+        enable = enable.strip()
+    if not _as_bool_setting(enable, default=bool(enable)):
+        return False
+    commands = _selected_output_commands(cfg)
+    if not commands or message_type not in commands:
+        return False
+    channels = cfg.get("channels", []) or []
+    if isinstance(channels, str):
+        channels = normalize_setting_list(channels, split_commas=True)
+    if not isinstance(channels, (list, tuple, set)):
+        return False
+    for channel in OUTPUT_SINK_TYPES:
+        if channel not in channels or channel in _MARKDOWN_ONLY_SINKS:
+            continue
+        if channel == "file":
+            path = cfg.get("file_path", _DEFAULT_OUTPUT_FILE_PATH)
+            if isinstance(path, str) and bool(path):
+                return True
+            continue
+        if channel == "webhook":
+            if _is_https_sink_url(cfg.get("webhook_url")):
+                return True
+            continue
+        return True
+    return False
 
 
 def _check_output_sinks(cfg: dict) -> tuple[bool, str] | None:
@@ -225,8 +271,8 @@ def _check_output_sinks(cfg: dict) -> tuple[bool, str] | None:
     if not _as_bool_setting(enable, default=bool(enable)):
         return None
 
-    if _selected_output_tools(cfg) is None:
-        return False, "push_outputs.tools must select supported tool names"
+    if _selected_output_commands(cfg) is None:
+        return False, "push_outputs.commands must select supported command names"
 
     channels = cfg.get("channels", [])
     if isinstance(channels, str):
@@ -240,7 +286,7 @@ def _check_output_sinks(cfg: dict) -> tuple[bool, str] | None:
         return False, "push_outputs.channels must select registered output sinks"
 
     if "file" in selected:
-        path = cfg.get("file_path", "pr-agent-outputs/reviews.jsonl")
+        path = cfg.get("file_path", _DEFAULT_OUTPUT_FILE_PATH)
         if not isinstance(path, str) or not path:
             return False, "push_outputs.file_path must be a nonempty string"
     for channel, key in (
@@ -248,16 +294,7 @@ def _check_output_sinks(cfg: dict) -> tuple[bool, str] | None:
     ):
         if channel not in selected:
             continue
-        url = cfg.get(key)
-        valid = False
-        if isinstance(url, str):
-            try:
-                parsed = urlparse(url)
-                valid = parsed.scheme == "https" and bool(parsed.hostname)
-            except ValueError:
-                # Malformed URLs use the same value-free failure message below.
-                pass
-        if not valid:
+        if not _is_https_sink_url(cfg.get(key)):
             return False, f"push_outputs.{key} must be an absolute https:// URL with a host"
     if "telegram" in selected:
         for key in ("telegram_bot_token", "telegram_chat_id"):

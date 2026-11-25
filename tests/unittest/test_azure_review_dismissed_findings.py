@@ -9,9 +9,9 @@ from pr_agent.algo.comment_identity import PRReviewHeader
 from pr_agent.algo.findings import Finding
 from pr_agent.algo.inline_comment_dedup import key_issue_body_with_markers
 from pr_agent.algo.review_finding_state import reconcile_review_findings, serialize_review_state
+from pr_agent.commands.pr_reviewer import PRReviewer
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.azuredevops_provider import AzureDevopsProvider
-from pr_agent.tools.pr_reviewer import PRReviewer
 
 BOT = "11111111-1111-1111-1111-111111111111"
 BODY = "**Possible Issue**\n\nThe lock is never released."
@@ -118,11 +118,8 @@ def test_only_root_marker_counts_and_improve_context_is_unchanged(provider):
     suggestion["comments"][0]["content"] = "Try this\n```suggestion\nreplacement\n```"
     suggestion["comments"].append(key_issue["comments"][0])
     provider._threads_cache = [suggestion]
-    before = provider.get_code_suggestion_thread_context()
-    assert before
     assert reviewer(provider)._load_dismissed_key_issues() == []
     provider._threads_cache.append(key_issue)
-    assert provider.get_code_suggestion_thread_context() == before
     assert len(reviewer(provider)._load_dismissed_key_issues()) == 1
 
 

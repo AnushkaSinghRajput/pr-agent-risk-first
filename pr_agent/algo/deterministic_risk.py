@@ -35,6 +35,7 @@ MAX_FINDINGS_PER_CATEGORY = 10
 DEFAULT_SENSITIVE_PATHS: tuple[str, ...] = (
     # Workflows and CI files
     ".github/workflows/**",
+    ".github/actions/**",
     ".gitlab-ci.yml",
     "Jenkinsfile*",
     ".circleci/**",
@@ -138,29 +139,30 @@ _CACHE_LOGIC_PATTERNS: list[tuple[str, str, re.Pattern]] = [
     ),
 ]
 
-# Function signature removal / rewrite (on '-' lines only)
+# Function signature removal / rewrite (on '-' lines only). Leading whitespace is allowed so methods
+# inside classes and impl blocks count too.
 _REMOVED_FUNCTION_PATTERNS: list[tuple[str, str, re.Pattern]] = [
     (
         "removed_function",
         "Removed Python function",
-        re.compile(r"^-(?:async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*\s*\("),
+        re.compile(r"^-\s*(?:async\s+)?def\s+[A-Za-z_][A-Za-z0-9_]*\s*\("),
     ),
     (
         "removed_function",
         "Removed JS/TS function",
         re.compile(
-            r"^-(?:export\s+)?(?:default\s+)?(?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*\("
+            r"^-\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*\("
         ),
     ),
     (
         "removed_function",
         "Removed Go function",
-        re.compile(r"^-func\s+(?:\([^)]+\)\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\("),
+        re.compile(r"^-\s*func\s+(?:\([^)]+\)\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\("),
     ),
     (
         "removed_function",
         "Removed Rust function",
-        re.compile(r"^-(?:pub\s+)?(?:async\s+)?fn\s+[A-Za-z_][A-Za-z0-9_]*\s*[(<]"),
+        re.compile(r"^-\s*(?:pub\s+)?(?:async\s+)?fn\s+[A-Za-z_][A-Za-z0-9_]*\s*[(<]"),
     ),
 ]
 
@@ -182,20 +184,85 @@ def normalize_file_path(path: str | None) -> str:
     return norm[:MAX_PATH_LENGTH]
 
 
+def _globstar_match(path_parts: tuple[str, ...], pat: str) -> bool:
+    """Match POSIX path segments against a glob containing a standalone `**` segment.
+
+    Python 3.12's `PurePosixPath.match()` treats `**` as a single-segment wildcard, so
+    patterns like `alembic/**` miss deeply nested paths and `**/auth/**` misses root-level
+    paths. Relative patterns match at any directory boundary (like `PurePosixPath.match`),
+    while leading-`/` patterns anchor at repository root. A trailing `**` requires at least
+    one child segment beneath its parent. Worst-case segment matching is O(|path| * |pat|),
+    bounded by MAX_PATH_LENGTH and MAX_GLOB_LENGTH without regex backtracking across `**`.
+    """
+    anchored = pat.startswith("/")
+    raw_parts = [part for part in pat.split("/") if part and part != "."]
+    if "**" not in raw_parts:
+        return False
+    if pat.endswith("/"):
+        raw_parts.append("**")
+
+    pat_parts: list[str] = [] if anchored else ["**"]
+    for part in raw_parts:
+        if part == "**" and pat_parts and pat_parts[-1] == "**":
+            continue
+        pat_parts.append(part)
+
+    # A trailing `**` must match at least one segment beneath its parent directory.
+    if pat_parts[-1] == "**":
+        if not path_parts:
+            return False
+        target_parts = path_parts[:-1]
+    else:
+        target_parts = path_parts
+
+    pi = ti = 0
+    star_pi = -1
+    star_ti = 0
+    while ti < len(target_parts):
+        if pi < len(pat_parts) and pat_parts[pi] == "**":
+            star_pi = pi
+            star_ti = ti
+            pi += 1
+        elif pi < len(pat_parts) and fnmatchcase(target_parts[ti], pat_parts[pi]):
+            pi += 1
+            ti += 1
+        elif star_pi != -1:
+            star_ti += 1
+            ti = star_ti
+            pi = star_pi + 1
+        else:
+            return False
+
+    while pi < len(pat_parts) and pat_parts[pi] == "**":
+        pi += 1
+    return pi == len(pat_parts)
+
+
 def matches_sensitive_path(path: str, patterns: Sequence[str] | None = None) -> str | None:
     """Check if normalized path matches any sensitive path glob. Returns the matched glob or None."""
     norm = normalize_file_path(path)
     if not norm:
         return None
     globs = patterns if patterns is not None else DEFAULT_SENSITIVE_PATHS
+    parsed = None
+    path_parts = None
     for pat in globs:
         if not isinstance(pat, str) or not pat or len(pat) > MAX_GLOB_LENGTH:
             continue
-        if fnmatchcase(norm, pat) or PurePosixPath(norm).match(pat):
+        if fnmatchcase(norm, pat):
+            return pat
+        if parsed is None:
+            parsed = PurePosixPath(norm)
+        if parsed.match(pat):
             return pat
         # Also check basename for simple filename patterns like *.tf or package.json
-        if fnmatchcase(PurePosixPath(norm).name, pat):
+        if fnmatchcase(parsed.name, pat):
             return pat
+        if "**" in pat and "**" in pat.split("/"):
+            if path_parts is None:
+                path_parts = tuple(part for part in norm.split("/") if part and part != ".")
+            if _globstar_match(path_parts, pat):
+                return pat
     return None
 
 
@@ -242,10 +309,14 @@ def scan_file_diff(
     """
     spent = custom_pattern_seconds if custom_pattern_seconds is not None else {}
     findings = []
-    filename = file_info.filename or ""
+    filename = _file_value(file_info, "filename", "new_path", default="") or ""
 
     # Check for deleted file
-    if getattr(file_info, "edit_type", None) == EDIT_TYPE.DELETED:
+    if (
+        _file_value(file_info, "edit_type") == EDIT_TYPE.DELETED
+        or _file_value(file_info, "deleted_file") is True
+        or _file_value(file_info, "status") in ("removed", "deleted")
+    ):
         findings.append({
             "category": "deleted_file",
             "description": "Deleted file",
@@ -262,7 +333,7 @@ def scan_file_diff(
             "line": "",
         })
 
-    patch = file_info.patch or ""
+    patch = _file_value(file_info, "patch", "diff") or ""
     if not patch:
         return findings
 
@@ -381,16 +452,26 @@ def _extract_file_paths(file_entry: Any) -> list[str]:
     return paths
 
 
+def _file_value(file_entry: Any, *names: str, default: Any = None) -> Any:
+    for name in names:
+        value = file_entry.get(name) if isinstance(file_entry, dict) else getattr(file_entry, name, None)
+        if value is not None:
+            return value
+    return default
+
+
 def build_risk_checks(
     diff_files: list[FilePatchInfo] | None,
     unfiltered_files: Sequence[Any] | None = None,
+    *,
+    include_clean: bool = False,
 ) -> dict | None:
-    """Assess deterministic risk for all diff files and unfiltered files in the PR. Return findings dict or None."""
+    """Assess PR risk; return clean results only when requested, and None when unavailable."""
     try:
         settings = get_settings()
         if not _as_bool_setting(settings.pr_reviewer.get("enable_risk_checks", True), default=True):
             return None
-        if not diff_files and not unfiltered_files:
+        if diff_files is None and not unfiltered_files:
             return None
 
         configured_paths = settings.pr_reviewer.get("sensitive_paths", DEFAULT_SENSITIVE_PATHS)
@@ -408,9 +489,11 @@ def build_risk_checks(
 
         seen_sensitive = set()
         for file in (diff_files or []):
-            filename = normalize_file_path(getattr(file, "filename", ""))
+            if isinstance(file, dict) and (file.get("too_large") is True or file.get("collapsed") is True):
+                return None
+            filename = normalize_file_path(_file_value(file, "filename", "new_path", default=""))
             old_filename = normalize_file_path(
-                getattr(file, "old_filename", None) or getattr(file, "previous_filename", None)
+                _file_value(file, "old_filename", "previous_filename", "old_path")
             )
 
             # Check sensitive paths for current filename
@@ -428,12 +511,18 @@ def build_risk_checks(
                     sensitive_matches.append({"file": old_filename, "pattern": matched_old})
 
             # Check deleted files
-            if getattr(file, "edit_type", None) == EDIT_TYPE.DELETED:
+            if (
+                _file_value(file, "edit_type") == EDIT_TYPE.DELETED
+                or _file_value(file, "deleted_file") is True
+                or _file_value(file, "status") in ("removed", "deleted")
+            ):
                 deleted_name = filename or old_filename
                 if deleted_name and deleted_name not in deleted_files:
                     deleted_files.append(deleted_name)
 
             # Scan diff patch
+            if _file_value(file, "patch", "diff") is None:
+                return None
             shapes = scan_file_diff(file, custom_patterns, custom_pattern_seconds)
             risky_shapes.extend(shape for shape in shapes if shape["category"] != "deleted_file")
 
@@ -449,7 +538,7 @@ def build_risk_checks(
                             sensitive_matches.append({"file": norm, "pattern": matched})
 
         has_findings = bool(sensitive_matches or risky_shapes or deleted_files)
-        if not has_findings:
+        if not has_findings and not include_clean:
             return None
 
         return {

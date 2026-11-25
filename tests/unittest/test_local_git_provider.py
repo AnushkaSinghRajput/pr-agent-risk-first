@@ -3,11 +3,11 @@ import pytest
 
 from pr_agent.algo.git_patch_processing import count_patch_lines
 from pr_agent.algo.token_handler import TokenEncoder
-from pr_agent.algo.types import EDIT_TYPE, FilePatchInfo
+from pr_agent.algo.types import EDIT_TYPE
+from pr_agent.commands.pr_add_docs import PRAddDocs
 from pr_agent.config_loader import get_settings
+from pr_agent.git_providers import gerrit_provider
 from pr_agent.git_providers.local_git_provider import LocalGitProvider
-from pr_agent.tools.pr_add_docs import PRAddDocs
-from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
 from tests.unittest._settings_helpers import restore_settings, snapshot_settings
 
 
@@ -149,6 +149,29 @@ def test_get_files_returns_new_path_for_renamed_file(tmp_path):
     assert provider.get_files() == ["new.py"]
 
 
+def test_shallow_checkout_requires_history_for_local_comparison(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    repo = _make_repo(source, ["app.py"])
+    target = repo.active_branch.name
+    repo.git.checkout("-b", "feature")
+    (source / "app.py").write_text("changed = True\n")
+    repo.index.add(["app.py"])
+    repo.index.commit("Change app.py")
+
+    checkout = git.Repo.clone_from(source.as_uri(), tmp_path / "checkout", depth=1, no_single_branch=True)
+    checkout.create_head(target, f"origin/{target}")
+    monkeypatch.chdir(checkout.working_tree_dir)
+    snapshot = snapshot_settings(["pr_reviewer.inline_code_comments"])
+    try:
+        with pytest.raises(ValueError, match="No merge base"):
+            LocalGitProvider(target)
+
+        checkout.git.fetch("--unshallow")
+        assert LocalGitProvider(target).get_files() == ["app.py"]
+    finally:
+        restore_settings(snapshot)
+
+
 def test_local_diff_applies_ignore_rules_to_files_and_patches(tmp_path):
     names = ["generated/schema.py", "generated/uv.lock", "src/app.py", "yarn.lock"]
     repo = _make_repo(tmp_path, names)
@@ -218,6 +241,42 @@ def test_get_diff_files_deleted_file_falls_back_to_old_path(tmp_path):
     assert deleted[0].filename == "gone.py"
     # every diff file exposes a usable filename for downstream consumers.
     assert all(f.filename is not None for f in diff_files)
+
+
+@pytest.mark.parametrize("provider_name", ["local", "gerrit"])
+def test_submodule_bump_preserves_gitlink_patch_and_sibling(tmp_path, monkeypatch, provider_name):
+    dep = _make_repo(tmp_path / "dependency", ["lib.py"])
+    root = tmp_path / "project"
+    repo = _make_repo(root, ["app.py"])
+    target = repo.active_branch.name
+    module = repo.create_submodule("library", "library", url=dep.working_tree_dir)
+    old = module.hexsha
+    repo.index.commit("pin library")
+    repo.git.checkout("-b", "feature")
+    new = module.module().index.commit("update library").hexsha
+    (root / "app.py").write_text("updated\n")
+    repo.git.add("library", "app.py")
+    repo.index.commit("bump library and update caller")
+    repo.git.submodule("deinit", "--", "library")
+
+    snapshot = snapshot_settings(["pr_reviewer.inline_code_comments", "gerrit.url", "gerrit.user"])
+    try:
+        if provider_name == "local":
+            monkeypatch.chdir(root)
+            provider = LocalGitProvider(target)
+        else:
+            get_settings().set("gerrit.url", "ssh://gerrit.example.test:29418")
+            get_settings().set("gerrit.user", "reviewer")
+            monkeypatch.setattr(gerrit_provider, "prepare_repo", lambda *args: str(root))
+            provider = gerrit_provider.GerritProvider("project:refs/changes/01/1/1")
+        files = {file.filename: file for file in provider.pr.diff_files}
+    finally:
+        restore_settings(snapshot)
+
+    link = files["library"]
+    assert link.base_file == link.head_file == ""
+    assert f"-Subproject commit {old}\n+Subproject commit {new}" in link.patch
+    assert (files["app.py"].base_file, files["app.py"].head_file) == ("x\n", "updated\n")
 
 
 @pytest.mark.parametrize("change_type", ["added", "modified", "deleted"])
@@ -329,44 +388,6 @@ def test_publish_code_suggestions_artifact_includes_partial_coverage(tmp_path):
     assert "1 of 2 analysis chunks failed" in content
 
 
-@pytest.mark.asyncio
-async def test_mixed_suggestions_stay_in_improve_artifact(tmp_path):
-    improve_path = tmp_path / "improve.md"
-    review_path = tmp_path / "review.md"
-    provider = object.__new__(LocalGitProvider)
-    provider.improve_path = improve_path
-    provider.review_path = review_path
-    provider.diff_files = [FilePatchInfo(
-        base_file="old()\n",
-        head_file="old()\n",
-        patch="",
-        filename="app.py",
-    )]
-    tool = PRCodeSuggestions.__new__(PRCodeSuggestions)
-    tool.git_provider = provider
-    tool.progress_response = None
-
-    suggestion = {
-        "label": "maintainability",
-        "relevant_file": "app.py",
-        "suggestion_content": "Use the helper.",
-        "existing_code": "old()",
-        "improved_code": "new()",
-        "score": 8,
-    }
-    await tool.push_inline_code_suggestions({"code_suggestions": [
-        {**suggestion, "relevant_lines_start": 1, "relevant_lines_end": 1},
-        {**suggestion, "suggestion_content": "Keep this advice.",
-         "relevant_lines_start": 40, "relevant_lines_end": 40},
-    ]})
-
-    content = improve_path.read_text(encoding="utf-8")
-    assert content.index("Use the helper.") < content.index("Keep this advice.")
-    assert content.count("```suggestion") == 1
-    assert "because the anchored range is outside the file" in content
-    assert not review_path.exists()
-
-
 def test_publish_code_suggestions_uses_custom_heading_without_identity(tmp_path):
     snapshot = snapshot_settings(["pr_code_suggestions.suggestions_heading"])
     improve_path = tmp_path / "improve.md"
@@ -382,45 +403,6 @@ def test_publish_code_suggestions_uses_custom_heading_without_identity(tmp_path)
     content = improve_path.read_text()
     assert content.startswith("# Team Suggestions ✨\n\n")
     assert "<!-- pr-agent:improve" not in content
-
-
-@pytest.mark.asyncio
-async def test_publish_no_suggestions_routes_local_git_output_to_improve_file(tmp_path, monkeypatch):
-    snapshot = snapshot_settings([
-        "config.output_run_details",
-        "config.publish_output",
-        "pr_code_suggestions.publish_output_no_suggestions",
-        "pr_code_suggestions.suggestions_heading",
-    ])
-    improve_path = tmp_path / "improve.md"
-    review_path = tmp_path / "review.md"
-    provider = object.__new__(LocalGitProvider)
-    provider.improve_path = improve_path
-    provider.review_path = review_path
-    tool = PRCodeSuggestions.__new__(PRCodeSuggestions)
-    tool.git_provider = provider
-    tool.progress_response = None
-    try:
-        get_settings().set("config.output_run_details", True)
-        get_settings().set("config.publish_output", True)
-        get_settings().set("pr_code_suggestions.publish_output_no_suggestions", True)
-        get_settings().set("pr_code_suggestions.suggestions_heading", "Team Suggestions")
-        monkeypatch.setattr(
-            "pr_agent.algo.run_output.show_run_details",
-            lambda gfm_supported: "\n\nRun details" if not gfm_supported else "",
-        )
-
-        await tool.publish_no_suggestions()
-    finally:
-        restore_settings(snapshot)
-
-    assert provider.supports_code_suggestions_artifact() is True
-    content = improve_path.read_text()
-    assert content.startswith("# Team Suggestions ✨\n\n")
-    assert "No code suggestions found for the PR." in content
-    assert "Run details" in content
-    assert "<!-- pr-agent:improve" not in content
-    assert not review_path.exists()
 
 
 def test_publish_comment_skips_temporary(tmp_path):
@@ -450,15 +432,15 @@ def test_publish_description_writes_utf8_regardless_of_locale(tmp_path, monkeypa
     provider = object.__new__(LocalGitProvider)
     provider.description_path = description_path
 
-    provider.publish_description("my-branch", "✨ Describe tool usage guide")
-    assert description_path.read_text(encoding="utf-8") == "my-branch\n✨ Describe tool usage guide"
+    provider.publish_description("my-branch", "✨ Describe command usage guide")
+    assert description_path.read_text(encoding="utf-8") == "my-branch\n✨ Describe command usage guide"
 
 
 @pytest.mark.parametrize(
-    "tool, output_attr",
+    "command, output_attr",
     [("improve", "improve_path"), ("describe", "description_path"), ("add_docs", "improve_path")],
 )
-def test_publish_tool_failure_keeps_review_file(tmp_path, tool, output_attr):
+def test_publish_command_failure_keeps_review_file(tmp_path, command, output_attr):
     # A failed /improve, /describe or /add_docs must not overwrite the persisted /review result.
     review_path = tmp_path / "review.md"
     review_path.write_text("previous review")
@@ -467,7 +449,7 @@ def test_publish_tool_failure_keeps_review_file(tmp_path, tool, output_attr):
     provider.improve_path = tmp_path / "improve.md"
     provider.description_path = tmp_path / "description.md"
 
-    provider.publish_tool_failure(tool, "Failed")
+    provider.publish_command_failure(command, "Failed")
 
     assert review_path.read_text() == "previous review"
     assert getattr(provider, output_attr).read_text() == "Failed"
@@ -480,10 +462,10 @@ def test_add_docs_empty_result_keeps_review_file(tmp_path):
     provider.review_path = review_path
     provider.improve_path = tmp_path / "improve.md"
     provider.description_path = tmp_path / "description.md"
-    tool = PRAddDocs.__new__(PRAddDocs)
-    tool.git_provider = provider
+    command = PRAddDocs.__new__(PRAddDocs)
+    command.git_provider = provider
 
-    result = tool.push_inline_docs({"Code Documentation": []})
+    result = command.push_inline_docs({"Code Documentation": []})
 
     assert result is None
     assert review_path.read_text() == "previous review"
@@ -544,7 +526,7 @@ def test_add_jira_tickets_scans_local_branch_name(tmp_path, monkeypatch):
     # string. A non-str branch made the join raise, which was logged as
     # "Error extracting Jira tickets: ... expected str instance, HEAD found" on
     # every local run, even with Jira unconfigured.
-    from pr_agent.tools import ticket_pr_compliance_check as tickets
+    from pr_agent.commands import ticket_pr_compliance_check as tickets
 
     _, _, provider = _make_feature_branch_provider(tmp_path, monkeypatch, "feature/PROJ-123-fix")
     scanned = []

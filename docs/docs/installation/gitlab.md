@@ -67,6 +67,12 @@ pr_agent_job:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
 ```
 
+For published PR-Agent releases through v0.50.0, `review` identifies
+potential issues and `improve` provides separate code suggestions. In newer
+versions, both commands produce a review that may include suggested fixes.
+If your version has this behavior, remove the `improve` step above to avoid
+reviewing the same merge request twice.
+
 This script runs PR-Agent when a merge request pipeline is created, including when a merge request is opened and when new commits are pushed to its source branch. You can modify the `rules` section to run PR-Agent on different events.
 You can also modify the `script` section to run different PR-Agent commands, or with different parameters by exporting different environment variables.
 
@@ -90,7 +96,7 @@ Note that if your base branches are not protected, don't set the variables as `p
 
 #### CI artifact context
 
-A file produced by an earlier job — a test report, a coverage summary, a linter or SAST output — can be handed to `/review`, `/describe`, `/improve` and `/ask` as extra context, so the model reviews the merge request with your pipeline's own findings in hand. Save the file as a job artifact, make the PR-Agent job depend on that job with `needs:`, and point PR-Agent at it with `ARTIFACT_PATH`. The job above runs from `/app`, so give the path in full:
+A file produced by an earlier job — a test report, a coverage summary, a linter or SAST output — can be handed to `/review`, `/describe` and `/ask` as extra context, so the model reviews the merge request with your pipeline's own findings in hand. Save the file as a job artifact, make the PR-Agent job depend on that job with `needs:`, and point PR-Agent at it with `ARTIFACT_PATH`. The job above runs from `/app`, so give the path in full:
 
 ```yaml
 pr_agent_job:
@@ -106,7 +112,7 @@ pr_agent_job:
     - python -m pr_agent.cli --pr_url="$MR_URL" review
 ```
 
-Setting `ARTIFACT_PATH` turns the feature on by itself. The remaining knobs — which tools receive the context, the label, the size limit — are the `[artifacts]` settings described under [CI artifact context](./github.md#ci-artifact-context) for the GitHub Action, and they apply to the CLI in the same way.
+Setting `ARTIFACT_PATH` turns the feature on by itself. The remaining knobs — which commands receive the context, the label, the size limit — are the `[artifacts]` settings described under [CI artifact context](./github.md#ci-artifact-context) for the GitHub Action, and they apply to the CLI in the same way.
 
 #### Ignore bot-created merge requests
 
@@ -182,7 +188,7 @@ For all supported filters, see [Ignoring automatic commands in PRs](../usage-gui
    PORT=3000  # Optional: override the webhook server port
    ```
 
-8. Create a webhook in your GitLab project. Set the URL to `http[s]://<PR_AGENT_HOSTNAME>/webhook`, the secret token to the generated secret from step 3, and enable the triggers `push`, `comments` and `merge request events`.
+8. Create a webhook in your GitLab project. Set the URL to `http[s]://<PR_AGENT_HOSTNAME>/webhook`, the secret token to the generated secret from step 3, and enable the `comments` and `merge request events` triggers. The separate `push` trigger is not required for merge request push commands.
 
 9. Test your installation by opening a merge request or commenting on a merge request using one of PR Agent's commands.
 
@@ -209,8 +215,7 @@ For example: `GITLAB.PERSONAL_ACCESS_TOKEN` --> `GITLAB__PERSONAL_ACCESS_TOKEN`
 
 4. Create a lambda function that uses the uploaded image. Add the IAM permission `lambda:InvokeFunction` on the function itself to the execution role: the webhook is acknowledged as soon as its token is validated, and the review runs in a second, asynchronous invocation of the same function. Set the lambda timeout for the review length (for example 5m) — it no longer needs to cover the webhook acknowledgement. Lambda retries a timed-out or failed asynchronous invocation twice by default, which would run the review again; set the function's asynchronous invocation retry attempts to 0 if you do not want that.
 5. Configure the lambda function to have a Function URL.
-6. In the environment variables of the Lambda function, specify `AZURE_DEVOPS_CACHE_DIR` to a writable location such as /tmp. (see [link](https://github.com/the-pr-agent/pr-agent/pull/450#issuecomment-1840242269))
-7. Go back to steps 8-9 of [Run a GitLab webhook server](#run-a-gitlab-webhook-server) with the function URL as your Webhook URL.
+6. Go back to steps 8-9 of [Run a GitLab webhook server](#run-a-gitlab-webhook-server) with the function URL as your Webhook URL.
     The Webhook URL would look like `https://<LAMBDA_FUNCTION_URL>/webhook`
 
 The asynchronous hand-off carries the verified payload, event UUID and authentication

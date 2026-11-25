@@ -50,21 +50,57 @@ def _bare_provider():
 def test_constructor_routes_by_url_resource(monkeypatch, url, repo_name, is_issue):
     client = Mock()
     repo = client.get_repo.return_value
-    repo.get_pull.return_value.head.sha = "a" * 40
-    repo.get_pull.return_value.get_commits.return_value = [SimpleNamespace(sha="a" * 40)]
+    pr = Mock()
+    pr.head.sha = "a" * 40
+    pr.get_commits.return_value = [SimpleNamespace(sha="a" * 40)]
+    pull_request = Mock(return_value=pr)
     monkeypatch.setattr(GithubProvider, "_get_github_client", lambda self: client)
+    monkeypatch.setattr(github_provider, "PullRequest", pull_request)
 
     provider = GithubProvider(url)
 
-    client.get_repo.assert_called_once_with(repo_name)
     if is_issue:
+        client.get_repo.assert_called_once_with(repo_name)
         repo.get_issue.assert_called_once_with(42)
-        repo.get_pull.assert_not_called()
+        pull_request.assert_not_called()
         assert provider.issue_main is repo.get_issue.return_value
     else:
-        repo.get_pull.assert_called_once_with(42)
-        repo.get_issue.assert_not_called()
-        assert provider.pr is repo.get_pull.return_value
+        # The pull payload carries its base repository, so no separate repository read is made.
+        client.get_repo.assert_not_called()
+        pull_request.assert_called_once_with(client.requester, url=f"/repos/{repo_name}/pulls/42")
+        assert provider.pr is pr
+        assert provider.repo_obj is pr.base.repo
+
+
+class _PullOnlyRequester:
+    """Serve only the pull endpoint, so any separate repository read fails the test."""
+    base_url = "https://api.github.test"
+    is_not_lazy = True
+
+    def __init__(self):
+        self.reads = []
+
+    def requestJsonAndCheck(self, method, url, parameters=None, headers=None, **kwargs):  # noqa: N802
+        self.reads.append(url)
+        assert method == "GET" and url.endswith("/repos/acme/app/pulls/7"), url
+        repo = {"url": f"{self.base_url}/repos/acme/app", "full_name": "acme/app", "default_branch": "main"}
+        return {}, {"url": f"{self.base_url}{url}", "number": 7, "base": {"ref": "main", "repo": repo}}
+
+
+def test_sdk_pull_read_keeps_the_embedded_base_repository():
+    requester = _PullOnlyRequester()
+    provider = GithubProvider.__new__(GithubProvider)
+    provider.github_client = SimpleNamespace(requester=requester)
+    provider.repo, provider.pr_num, provider.repo_obj = "acme/app", 7, None
+
+    pr = provider._get_pr()
+
+    assert requester.reads == ["/repos/acme/app/pulls/7"]
+    assert pr.number == 7
+    assert provider._get_repo() is provider.repo_obj
+    assert provider.repo_obj.default_branch == "main"
+    provider._get_pr()  # A refresh reuses the kept repository for the pull read alone.
+    assert requester.reads == ["/repos/acme/app/pulls/7", f"{requester.base_url}/repos/acme/app/pulls/7"]
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +883,30 @@ class TestGetDiffFilesRename:
         original_content_call = spy.call_args_list[-1]
         assert original_content_call.args[1] == "prev-sha"
         assert original_content_call.kwargs.get("path") == "old_dir/module.py"
+        assert p.get_files() == [f]
+
+    def test_incremental_diff_retry_preserves_unreviewed_file_objects(self, patched_helpers, monkeypatch):
+        f1 = _make_file("a.py", "modified")
+        f2 = _make_file("b.py", "modified")
+        p = _make_provider_for_diff([f1, f2])
+        p.incremental = SimpleNamespace(is_incremental=True, last_seen_commit_sha="prev-sha")
+        p.unreviewed_files_map = {"a.py": f1, "b.py": f2}
+        monkeypatch.setattr("pr_agent.git_providers.github_provider.time.sleep", lambda _s: None)
+        calls = {"b": 0}
+
+        def get_content(file, sha, path=None, **kwargs):
+            if file.filename == "b.py" and calls["b"] == 0:
+                calls["b"] += 1
+                raise GithubException(502, {"message": "bad gateway"}, {})
+            return f"{file.filename}@{sha}\n"
+
+        p._get_pr_file_content = get_content
+
+        diffs = p.get_diff_files()
+
+        assert calls["b"] == 1
+        assert [d.filename for d in diffs] == ["a.py", "b.py"]
+        assert p.get_files() == [f1, f2]
 
 
 # ---------------------------------------------------------------------------
@@ -1258,6 +1318,7 @@ class TestCompletePullRequestFiles:
         )
 
         assert provider.get_pr_file_paths() == files
+        assert provider.get_verdict_diff_files() == files
         assert provider.git_files == files
         assert request_context["git_files"] == files
         assert pr.get_files_calls == 1

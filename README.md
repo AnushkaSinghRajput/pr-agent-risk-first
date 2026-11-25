@@ -49,7 +49,7 @@ The feature is limited to `/review`. It supports both the normal compressed revi
 | --- | --- |
 | `pr_agent/algo/review_file_priority.py` | Builds deterministic priority levels and pairs conventional test names with changed files. |
 | `pr_agent/algo/pr_processing.py` | Applies the priority order only when the diff exceeds the budget; retains the original order within each level. |
-| `pr_agent/tools/pr_reviewer.py` | Connects `/review` to the shared risk checks and the single-call and chunked packers. |
+| `pr_agent/commands/pr_reviewer.py` | Connects `/review` to the shared risk checks and the single-call and chunked packers. |
 | `pr_agent/settings/configuration.toml` | Adds the opt-in setting. |
 | `tests/unittest/` | Checks coverage under a fixed budget, renames, chunking, the opt-in path, and full-diff behavior. |
 
@@ -69,7 +69,7 @@ Turn on the feature in your repository's `.pr_agent.toml` or host configuration:
 enable_risk_aware_compression = true
 ```
 
-`pr_reviewer.enable_risk_checks` must also be enabled; it is on by default. For a live review, configure your Git provider and model credentials, then run `/review` through your normal PR-Agent deployment. The [review guide](docs/docs/tools/review.md) explains the setting and the [upstream installation guide](https://docs.pr-agent.ai/installation/) covers deployment options.
+`pr_reviewer.enable_risk_checks` must also be enabled; it is on by default. For a live review, configure your Git provider and model credentials, then run `/review` through your normal PR-Agent deployment. The [review guide](docs/docs/commands/review.md) explains the setting and the [upstream installation guide](https://docs.pr-agent.ai/installation/) covers deployment options.
 
 ## Validation
 

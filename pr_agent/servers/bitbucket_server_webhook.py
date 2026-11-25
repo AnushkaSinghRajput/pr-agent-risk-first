@@ -22,10 +22,12 @@ from pr_agent.log import LoggingFormat, get_logger, setup_logger
 from pr_agent.servers.request_body_limit import create_server_app
 from pr_agent.servers.utils import (
     auto_feedback_disabled,
+    dedupe_review_commands,
     get_include_pr_labels,
     get_pr_commands,
     is_command_comment,
     payload_log_summary,
+    preload_host_settings_for_new_automatic_event,
     push_trigger_slot,
     shared_should_process_pr_logic,
     verify_signature,
@@ -151,6 +153,11 @@ async def handle_webhook(background_tasks: BackgroundTasks, request: Request):
     # push events without a pull request are already ignored above
     if (data["eventKey"] == "pr:opened"
             or data["eventKey"] in ["pr:from_ref_updated", "repo:refs_changed"]):
+        if not await preload_host_settings_for_new_automatic_event():
+            get_logger().warning("Request ignored: host settings could not be loaded", **log_context)
+            return JSONResponse(
+                status_code=status.HTTP_200_OK, content=jsonable_encoder({"message": "Host settings unavailable"})
+            )
         apply_repo_settings(pr_url)
         if not should_process_pr_logic(data):
             get_logger().info("PR ignored due to config settings", **log_context)
@@ -178,10 +185,11 @@ async def handle_webhook(background_tasks: BackgroundTasks, request: Request):
             commands_to_run.extend(_get_commands_list_from_settings('BITBUCKET_SERVER.PUSH_COMMANDS'))
             is_push_event = True
     elif data["eventKey"] == "pr:comment:added":
+        log_context["event"] = "comment"
         comment_text = data["comment"]["text"]
         if not is_command_comment(comment_text):
             # A plain comment whose first word happens to be a command name must not
-            # dispatch a tool: the dispatcher strips an optional leading slash.
+            # dispatch a command: the dispatcher strips an optional leading slash.
             get_logger().info("Ignoring comment not starting with /")
             return JSONResponse(
                 status_code=status.HTTP_200_OK,
@@ -213,11 +221,15 @@ async def handle_webhook(background_tasks: BackgroundTasks, request: Request):
 
 
 async def _run_commands_sequentially(commands: list[str], url: str, log_context: dict):
-    get_logger().info(f"Running commands sequentially: {commands}")
     if commands is None:
         return
 
+    is_comment_event = log_context.get("event") == "comment"
+    if not is_comment_event:
+        get_logger().info(f"Running commands sequentially: {commands}")
+
     for command in commands:
+        command_label = "comment_command" if is_comment_event else command
         try:
             # Reset diff state between auto commands, like the gitlab/github loops (#4372).
             if context.exists():
@@ -225,16 +237,21 @@ async def _run_commands_sequentially(commands: list[str], url: str, log_context:
                 reset_diff_cache = getattr(provider, "reset_diff_cache_for_command", None)
                 if callable(reset_diff_cache):
                     reset_diff_cache()
-            body = _process_command(command, url)
+            # Comment commands come from untrusted PR comments, so pass them straight to
+            # PRAgent.handle_request() like the other webhook servers instead of running
+            # them through prepare_command() (which is for configured auto-commands).
+            body = command if is_comment_event else _process_command(command, url)
 
-            log_context["action"] = body
+            # Use a fixed action label for comment events so untrusted comment text
+            # (such as rejected credentials) is never copied into structured logs.
+            log_context["action"] = command_label if is_comment_event else body
             log_context["api_url"] = url
 
             with get_logger().contextualize(**log_context):
                 if await PRAgent().handle_request(url, body) is RequestOutcome.SKIPPED:
                     return RequestOutcome.SKIPPED
         except Exception as e:
-            get_logger().error(f"Failed to handle command: {command} , error: {e}")
+            get_logger().error(f"Failed to handle command: {command_label} , error: {e}")
 
 def _process_command(command: str, url) -> list[str]:
     # don't think we need this
@@ -244,7 +261,7 @@ def _process_command(command: str, url) -> list[str]:
 
 def _get_commands_list_from_settings(setting_key: str) -> list:
     try:
-        return normalize_setting_list(get_settings().get(setting_key, []))
+        return dedupe_review_commands(normalize_setting_list(get_settings().get(setting_key, [])))
     except ValueError as e:
         get_logger().error(f"Failed to get commands list from settings {setting_key}: {e}")
         return []

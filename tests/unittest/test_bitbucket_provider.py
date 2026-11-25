@@ -2,18 +2,18 @@ import os
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from atlassian.bitbucket import Bitbucket
 from packaging.version import parse as parse_version
-from requests import Request, Response
+from requests import Request, Response, Session
+from requests.adapters import BaseAdapter
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import HTTPError, Timeout
 from requests.utils import get_encoding_from_headers
 
 from pr_agent.algo.comment_identity import (
-    PRCodeSuggestionsHeader,
-    PRCodeSuggestionsIdentity,
     PRReviewHeader,
     PRReviewIdentity,
 )
@@ -27,7 +27,6 @@ from pr_agent.git_providers.bitbucket_provider import (
 )
 from pr_agent.git_providers.git_provider import FileContentSnapshot, IncompleteBitbucketPullRequestFilesError
 from pr_agent.git_providers.request_timeout import DEFAULT_HTTP_REQUEST_TIMEOUT
-from pr_agent.tools.pr_code_suggestions import PRCodeSuggestions
 
 
 def _added_file(filename="src/example.py", lines=("a = 1", "b = 2", "c = 3")):
@@ -46,6 +45,34 @@ def _raw_file_response(contents: str, content_type: str, encoding: str = "utf-8"
     response.encoding = get_encoding_from_headers(response.headers)
     response._content = contents.encode(encoding)
     return response
+
+
+class _RawFileTransport(BaseAdapter):
+    """Answer like Bitbucket Server: raw files by the path and query it decodes, and the PR merge base."""
+
+    def __init__(self):
+        super().__init__()
+        self.files = {}
+        self.reads = []
+
+    def send(self, request, **kwargs):
+        target = urlsplit(request.url)  # a fragment after "#" is never sent
+        response = Response()
+        response.request = request
+        response.headers["Content-Type"] = "application/json"
+        if target.path.endswith("/merge-base"):
+            response.status_code, response._content = 200, b'{"id": "base-sha"}'
+            return response
+        read = (unquote(target.path.removeprefix("/rest/api/1.0/projects/AAA/repos/my-repo/raw/")), target.query)
+        self.reads.append(read)
+        if read in self.files:
+            response.status_code, response._content = 200, self.files[read].encode()
+        else:
+            response.status_code, response._content = 404, b'{"errors": [{"message": "No such path"}]}'
+        return response
+
+    def close(self):
+        pass
 
 
 class TestBitbucketProvider:
@@ -782,7 +809,7 @@ index 1111111..2222222 100644
 
         assert provider.pr.diffstat.call_count == 3
 
-    def test_filtered_empty_diff_reacquires_after_the_initial_pair(self):
+    def test_filtered_empty_diff_is_consistent_within_a_command_and_reacquires_at_the_boundary(self):
         provider, _ = self._aggregate_diff_provider(["src/first.py", "src/second.py"])
         provider.git_files = None
         with (
@@ -793,6 +820,13 @@ index 1111111..2222222 100644
             assert provider.get_diff_files() == []
             calls_after_first_diff = provider.pr.diffstat.call_count
             assert calls_after_first_diff == 1
+            # The filtered-empty verdict is completed, so the second call in the command
+            # is served from the cache instead of re-fetching (#4860).
+            assert provider.get_diff_files() == []
+            assert provider.pr.diffstat.call_count == calls_after_first_diff
+
+            # The command boundary re-acquires, as every auto command gets a fresh scope.
+            provider.reset_diff_cache_for_command()
             assert provider.get_diff_files() == []
 
         assert provider.pr.diffstat.call_count == calls_after_first_diff + 1
@@ -988,7 +1022,76 @@ index 1111111..2222222 100644
         )
 
         assert diff_file.filename == "new name.py"
+        assert diff_file.old_filename == "old name.py"
         assert diff_file.edit_type == EDIT_TYPE.RENAMED
+
+    def test_get_diff_files_preserves_old_filename_for_risk_checks_and_omits_for_non_renames(self):
+        from pr_agent.algo.deterministic_risk import build_risk_checks
+
+        renamed = self._get_single_diff_file(
+            "diff --git a/.pr_agent.toml b/notes.py\n"
+            "similarity index 90%\n"
+            "rename from .pr_agent.toml\n"
+            "rename to notes.py\n"
+            "--- a/.pr_agent.toml\n"
+            "+++ b/notes.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n",
+            "renamed",
+            1,
+            1,
+            "notes.py",
+            ".pr_agent.toml",
+        )
+        added = self._get_single_diff_file(
+            "diff --git a/added.py b/added.py\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/added.py\n"
+            "@@ -0,0 +1 @@\n"
+            "+x = 1\n",
+            "added",
+            1,
+            0,
+            "added.py",
+            None,
+        )
+        removed = self._get_single_diff_file(
+            "diff --git a/removed.py b/removed.py\n"
+            "deleted file mode 100644\n"
+            "--- a/removed.py\n"
+            "+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n"
+            "-x = 1\n",
+            "removed",
+            0,
+            1,
+            None,
+            "removed.py",
+        )
+        modified = self._get_single_diff_file(
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            "+new\n",
+            "modified",
+            1,
+            1,
+            "app.py",
+            "app.py",
+        )
+
+        assert renamed.old_filename == ".pr_agent.toml"
+        assert added.old_filename is None
+        assert removed.old_filename is None
+        assert modified.old_filename is None
+
+        risk = build_risk_checks([renamed])
+        assert risk is not None
+        assert any(entry["file"] == ".pr_agent.toml" for entry in risk["sensitive_paths"])
 
     @pytest.mark.parametrize("patch_paths", [
         ["src/first.py", "src/other.py"],
@@ -1139,7 +1242,7 @@ index 1111111..2222222 100644
 
         response.raise_for_status.assert_not_called()
 
-    @pytest.mark.parametrize("comment", [{"id": 123}, 123])
+    @pytest.mark.parametrize("comment", [{"id": 123}, 123, "123"])
     def test_remove_comment_accepts_returned_comment_or_stored_id(self, comment):
         provider = BitbucketProvider.__new__(BitbucketProvider)
         provider.pr = MagicMock()
@@ -1147,6 +1250,38 @@ index 1111111..2222222 100644
         provider.remove_comment(comment)
 
         provider.pr.delete.assert_called_once_with("comments/123")
+
+    def test_remove_comment_deletes_issue_comment_through_the_client(self):
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        cloud_comment = MagicMock()
+        cloud_comment.raw = "failure notice"
+        provider.pr = MagicMock()
+        provider.pr.comments.return_value = [cloud_comment]
+
+        [comment] = provider.get_issue_comments()
+        provider.remove_comment(comment)
+
+        cloud_comment.delete.assert_called_once_with()
+        provider.pr.delete.assert_not_called()
+
+    def test_remove_comment_deletes_unwrapped_cloud_comment_through_the_client(self):
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.pr = MagicMock()
+        cloud_comment = MagicMock()
+
+        provider.remove_comment(cloud_comment)
+
+        cloud_comment.delete.assert_called_once_with()
+        provider.pr.delete.assert_not_called()
+
+    @pytest.mark.parametrize("comment", [None, True, ""])
+    def test_remove_comment_does_not_delete_invalid_reference(self, comment):
+        provider = BitbucketProvider.__new__(BitbucketProvider)
+        provider.pr = MagicMock()
+
+        provider.remove_comment(comment)
+
+        provider.pr.delete.assert_not_called()
 
     def test_persistent_review_update_does_not_duplicate_when_status_message_fails(self):
         provider = BitbucketProvider.__new__(BitbucketProvider)
@@ -2070,35 +2205,6 @@ class TestBitbucketServerProvider:
         assert provider.get_comment_url(comment) == f"{expected_repo_url}/pull-requests/1/overview?commentId=7"
         assert provider.get_latest_commit_url() == f"{expected_repo_url}/commits/deadbeef12345678"
 
-    def test_improve_history_updates_existing_bitbucket_server_comment(self):
-        provider = self._persistent_provider()
-        existing_body = (
-            f"{PRCodeSuggestionsHeader.SUMMARY.value}\n\n"
-            f"{PRCodeSuggestionsIdentity.SUMMARY.value}\n\n"
-            "<!-- abc1234 -->\n\n<table>previous suggestions</table>"
-        )
-        provider.bitbucket_client.get_pull_requests_activities.return_value = [
-            self._comment_activity(existing_body),
-        ]
-
-        updated = PRCodeSuggestions.publish_persistent_comment_with_history(
-            provider,
-            f"{PRCodeSuggestionsHeader.SUMMARY.value}\n\n<table>new suggestions</table>",
-            initial_header=PRCodeSuggestionsHeader.SUMMARY.value,
-            name="suggestions",
-            final_update_message=False,
-            max_previous_comments=4,
-            identity_marker=PRCodeSuggestionsIdentity.SUMMARY.value,
-            legacy_initial_header=PRCodeSuggestionsHeader.SUMMARY.value,
-        )
-
-        assert updated.id == 7
-        provider.bitbucket_client.add_pull_request_comment.assert_not_called()
-        updated_body = provider.bitbucket_client.update_pull_request_comment.call_args.args[4]
-        assert PRCodeSuggestionsIdentity.SUMMARY.value in updated_body
-        assert "new suggestions" in updated_body
-        assert "Previous suggestions" in updated_body
-
     def test_publish_inline_comment_maps_payload_correctly(self):
         provider = self._provider_for_code_suggestions()
 
@@ -2286,7 +2392,9 @@ class TestBitbucketServerProvider:
         provider.pr_num = 1
         provider.pr = SimpleNamespace(fromRef={"latestCommit": "head-sha"})
         provider.bitbucket_api_version = None
-        provider.diff_files = []
+        # Nothing cached yet; under the #4860 contract an empty list is a completed
+        # verdict, so "not fetched" is None.
+        provider.diff_files = None
         provider.bitbucket_client = MagicMock()
         provider.bitbucket_client.get_pull_requests_commits.return_value = [
             {"parents": [{"id": "base-sha"}]}
@@ -2332,6 +2440,46 @@ class TestBitbucketServerProvider:
 
         with pytest.raises(HTTPError, match="500 error"):
             provider.get_diff_files()
+
+    @pytest.fixture
+    def raw_read_provider(self):
+        transport = _RawFileTransport()
+        with Session() as session:
+            session.mount("https://", transport)
+            provider = BitbucketServerProvider.__new__(BitbucketServerProvider)
+            provider.workspace_slug = "AAA"
+            provider.repo_slug = "my-repo"
+            provider.bitbucket_client = Bitbucket(url="https://bb.example.com", token="test-token", session=session)
+            yield provider, transport
+
+    @pytest.mark.parametrize("path", ["src/C#/Program.cs", "docs/what?.md", "data/100%25.txt"])
+    def test_get_file_sends_the_whole_path_and_revision(self, raw_read_provider, path):
+        provider, transport = raw_read_provider
+        transport.files[(path, "at=abc123")] = "content\n"
+
+        content = provider.get_file(path, "abc123")
+
+        assert transport.reads == [(path, "at=abc123")]
+        assert content == b"content\n"
+
+    def test_get_diff_files_reads_a_csharp_folder_file_at_both_revisions(self, raw_read_provider):
+        provider, transport = raw_read_provider
+        transport.files[("src/C#/Program.cs", "at=base-sha")] = "old\n"
+        transport.files[("src/C#/Program.cs", "at=head-sha")] = "new\n"
+        provider.pr_num = 1
+        provider.pr = SimpleNamespace(fromRef={"latestCommit": "head-sha"})
+        provider.bitbucket_api_version = parse_version("8.16")
+        provider.diff_files = None
+        provider._get_pull_request_changes = MagicMock(
+            return_value=[{"type": "MODIFY", "path": {"toString": "src/C#/Program.cs"}}]
+        )
+
+        [diff_file] = provider.get_diff_files()
+
+        assert transport.reads == [("src/C#/Program.cs", "at=base-sha"), ("src/C#/Program.cs", "at=head-sha")]
+        assert diff_file.filename == "src/C#/Program.cs"
+        assert diff_file.content_fetch_failed is False
+        assert diff_file.patch == "@@ -1 +1 @@\n-old\n+new\n"
 
     def test_get_repo_file_content_propagates_non_404_errors(self):
         provider = BitbucketServerProvider.__new__(BitbucketServerProvider)

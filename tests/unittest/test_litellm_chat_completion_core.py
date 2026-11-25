@@ -5,9 +5,11 @@ import httpx
 import litellm
 import openai
 import pytest
+from starlette_context import context
 
 import pr_agent.algo.ai_handlers.litellm_ai_handler as litellm_handler
-import pr_agent.algo.instruction_context as instruction_context
+from pr_agent.algo import instruction_context
+from pr_agent.config_loader import safe_request_cycle_context
 
 
 @pytest.fixture(autouse=True)
@@ -130,6 +132,83 @@ async def test_chat_completion_passes_seed_when_temperature_is_zero(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_opt_out", "host_opt_out", "expected_hidden"),
+    [(False, False, False), (True, False, True), ("true", False, True), (False, True, True),
+     ("false", True, True)],
+)
+async def test_litellm_message_log_setting_covers_app_diagnostics(
+    monkeypatch, request_opt_out, host_opt_out, expected_hidden
+):
+    settings = FakeSettings(settings_values={"LITELLM.TURN_OFF_MESSAGE_LOGGING": request_opt_out})
+    monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        litellm_handler, "global_settings",
+        FakeSettings(settings_values={"LITELLM.TURN_OFF_MESSAGE_LOGGING": host_opt_out}),
+    )
+    monkeypatch.setattr(litellm_handler, "get_verbosity_level", lambda: 2)
+    monkeypatch.setattr(litellm_handler.litellm, "turn_off_message_logging", False)
+    logger = MagicMock()
+    monkeypatch.setattr(litellm_handler, "get_logger", lambda: logger)
+
+    with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+        completion.return_value = _mock_response(content="private-response")
+        handler = litellm_handler.LiteLLMAIHandler()
+        assert litellm_handler.litellm.turn_off_message_logging is expected_hidden
+        if expected_hidden:
+            handler.prepare_logs = MagicMock(side_effect=AssertionError("response log should not be prepared"))
+        logger.reset_mock()
+        response, _ = await handler.chat_completion(
+            model="gpt-4o", system="private-system", user="private-user"
+        )
+
+    assert response == "private-response"
+    recorded_logs = repr(logger.mock_calls)
+    for private_text in ("private-system", "private-user", "private-response"):
+        assert (private_text not in recorded_logs) is expected_hidden
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("trusted_cli", "request_cli_mode", "publish_output", "verbosity", "expected_stdout"),
+    [(True, True, False, 2, True), (False, True, False, 2, False),
+     (True, True, True, 2, False), (True, True, False, 1, False)],
+)
+async def test_litellm_message_log_opt_out_keeps_unpublished_cli_result(
+    monkeypatch, capsys, trusted_cli, request_cli_mode, publish_output, verbosity, expected_stdout
+):
+    settings = FakeSettings(
+        config_values={"cli_mode": request_cli_mode, "publish_output": publish_output},
+        settings_values={"LITELLM.TURN_OFF_MESSAGE_LOGGING": True},
+    )
+    monkeypatch.setattr(litellm_handler, "get_settings", lambda: settings)
+    monkeypatch.setattr(litellm_handler, "global_settings", FakeSettings())
+    monkeypatch.setattr(litellm_handler, "get_verbosity_level", lambda: verbosity)
+    monkeypatch.setattr(litellm_handler.litellm, "turn_off_message_logging", False)
+    logger = MagicMock()
+    monkeypatch.setattr(litellm_handler, "get_logger", lambda: logger)
+
+    with safe_request_cycle_context({"_pr_agent_cli_invocation": trusted_cli}):
+        with patch.object(litellm_handler, "acompletion", new_callable=AsyncMock) as completion:
+            completion.return_value = _mock_response(content="private-response")
+            handler = litellm_handler.LiteLLMAIHandler()
+            logger.reset_mock()
+            await handler.chat_completion(model="gpt-4o", system="private-system", user="private-user")
+
+    assert ("private-response" in capsys.readouterr().out) is expected_stdout
+    assert "private-response" not in repr(logger.mock_calls)
+
+
+def test_cli_settings_scope_marks_trusted_invocation():
+    from pr_agent.cli import _cli_settings_scope
+
+    with safe_request_cycle_context({}):
+        with _cli_settings_scope():
+            assert context["_pr_agent_cli_invocation"] is True
+        assert "_pr_agent_cli_invocation" not in context
+
+
+@pytest.mark.asyncio
 async def test_claude_empty_system_prompt_uses_public_request_normalization(monkeypatch):
     monkeypatch.setattr(litellm_handler, "get_settings", FakeSettings)
 
@@ -189,7 +268,7 @@ async def test_chat_completion_dead_image_uses_current_help_link(monkeypatch):
             img_path="https://example.test/missing.png",
         )
 
-    assert "https://docs.pr-agent.ai/tools/ask/#ask-on-images" in response
+    assert "https://docs.pr-agent.ai/commands/ask/#ask-on-images" in response
     assert "pr-agent-docs.codium.ai" not in response
     assert finish_reason == "error"
     mock_call.assert_not_awaited()
@@ -677,10 +756,10 @@ def test_request_messages_append_protected_system_instructions(monkeypatch):
     )
     handler = litellm_handler.LiteLLMAIHandler()
 
-    messages = handler.build_request_messages("gpt-4o", "tool instructions", "usr")
+    messages = handler.build_request_messages("gpt-4o", "command instructions", "usr")
 
     assert messages == [
-        {"role": "system", "content": "tool instructions\n\nTRUSTED POLICY"},
+        {"role": "system", "content": "command instructions\n\nTRUSTED POLICY"},
         {"role": "user", "content": "usr"},
     ]
 
@@ -1048,7 +1127,7 @@ async def test_chat_completion_streaming_empty_without_length_still_retries(monk
 
 @pytest.mark.asyncio
 async def test_length_truncation_reaches_the_fallback_model(monkeypatch):
-    import pr_agent.algo.pr_processing as pr_processing
+    from pr_agent.algo import pr_processing
 
     monkeypatch.setattr(pr_processing, "_get_all_models", lambda model_type: ["primary", "fallback"])
     monkeypatch.setattr(pr_processing, "_get_all_deployments", lambda models: [None, None])

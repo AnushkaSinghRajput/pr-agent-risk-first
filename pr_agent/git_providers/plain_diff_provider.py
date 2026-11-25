@@ -63,7 +63,7 @@ class PlainDiffGitProvider(GitProvider):
         self.json_output_path = get_settings().get("plain_diff.json_output_path", None)
         # cli.run() already forces config.publish_output=True, but apply_repo_settings()
         # runs afterwards and can overwrite it back to False from an extra/repo config
-        # (tools gate all publishing on this flag). This provider is constructed after
+        # (commands gate all publishing on this flag). This provider is constructed after
         # apply_repo_settings, so re-assert it here: stdout/--output is plain-diff mode's
         # only output channel, and it must never be silently suppressed.
         get_settings().set("config.publish_output", True)
@@ -91,7 +91,9 @@ class PlainDiffGitProvider(GitProvider):
                 "(working-tree enrichment disabled)."
             )
         for f in files:
-            head = ""
+            # None: the working-tree file was not read (missing, unsafe, or
+            # unreadable). A successful read of an empty file is "".
+            head = None
             if root is not None and f.filename:
                 if os.path.isabs(f.filename):
                     get_logger().info(
@@ -109,9 +111,9 @@ class PlainDiffGitProvider(GitProvider):
                                 head = fh.read()
                         except (OSError, UnicodeDecodeError) as e:
                             get_logger().info(f"Could not read working-tree file {f.filename}: {e}")
-            base = reconstruct_base_file_checked(head, f.patch) if head else None
+            base = reconstruct_base_file_checked(head, f.patch) if head is not None else None
             if base is None:
-                if head:
+                if head is not None:
                     get_logger().info(f"Working-tree file does not match diff; using patch-only context: {f.filename}")
                 f.head_file = ""
                 f.base_file = ""
@@ -147,7 +149,7 @@ class PlainDiffGitProvider(GitProvider):
             print(content)
         except UnicodeEncodeError:
             # Emit UTF-8 bytes when a redirected stdout uses a locale encoding (cp1252 on
-            # Windows) that cannot encode the emoji in tool output, so publishing does not
+            # Windows) that cannot encode the emoji in command output, so publishing does not
             # abort before --output is written.
             buffer = getattr(sys.stdout, "buffer", None)
             if buffer is None:
@@ -224,7 +226,7 @@ class PlainDiffGitProvider(GitProvider):
 
     # ---- code suggestions: rendered to stdout/--output (no hosting platform) ----
     def publish_code_suggestions(self, code_suggestions: list) -> bool:
-        # The 'improve' tool calls this unconditionally; render the suggestions
+        # The 'improve' command calls this unconditionally; render the suggestions
         # as a single markdown document to stdout/--output instead of pushing
         # them to a (non-existent) hosting platform.
         if not code_suggestions:

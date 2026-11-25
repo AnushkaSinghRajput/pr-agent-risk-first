@@ -13,7 +13,7 @@ from starlette_context import request_cycle_context
 
 from pr_agent.config_loader import get_settings
 from pr_agent.identity_providers.identity_provider import Eligibility
-from pr_agent.servers import bitbucket_server_webhook, gitea_app, github_app
+from pr_agent.servers import bitbucket_app, bitbucket_server_webhook, gitea_app, github_app
 
 
 @pytest.fixture
@@ -66,6 +66,52 @@ class _StubRequest:
 
     async def body(self):
         return json.dumps(self._payload).encode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ignored_author", "username", "nickname"),
+    [
+        ("blocked", None, "blocked"),
+        ("Alice Smith", None, "blocked"),
+        ("Alice Smith", "account", None),
+        ("blocked", "account", "blocked"),
+    ],
+)
+async def test_bitbucket_cloud_host_author_filter_checks_provider_identity(
+    monkeypatch, ignored_author, username, nickname,
+):
+    settings = copy.deepcopy(get_settings())
+    settings.set("CONFIG.EXTRA_CONFIG_URL", "")
+    settings.set("CONFIG.IGNORE_PR_AUTHORS", [f"^{ignored_author}$"])
+    monkeypatch.setattr(bitbucket_app, "global_settings", settings)
+    monkeypatch.setattr(bitbucket_app, "_verify_webhook_jwt", lambda *_args: ("client", "secret"))
+    oauth_calls = []
+
+    async def oauth(_secret, _client):
+        oauth_calls.append(True)
+        return "token"
+
+    monkeypatch.setattr(bitbucket_app, "get_bearer_token", oauth)
+    request = _StubRequest({
+        "event": "pullrequest:created",
+        "data": {
+            "actor": {"type": "user", "display_name": "collaborator"},
+            "pullrequest": {
+                "title": "Regular PR",
+                "author": {"username": username, "nickname": nickname, "display_name": "Alice Smith"},
+                "source": {"branch": {"name": "feature"}},
+                "destination": {"branch": {"name": "main"}, "repository": {"full_name": "org/repo"}},
+            },
+        },
+    })
+    request.headers["authorization"] = "JWT test-token"
+    tasks = BackgroundTasks()
+    with request_cycle_context({"settings": copy.deepcopy(settings)}):
+        assert await bitbucket_app.handle_github_webhooks(tasks, request) == "OK"
+        await tasks()
+
+    assert not oauth_calls, "both webhook and provider author identities must honor Host exclusions"
 
 
 @pytest.mark.asyncio
@@ -276,7 +322,7 @@ async def test_gitlab_diff_note_ask_still_uses_ask_line(gitlab_webhook_module, m
     assert calls == [(
         "https://gitlab.com/org/repo/-/merge_requests/1",
         ["/ask_line", "--line_start=3", "--line_end=3", "--side=RIGHT",
-         "--file_name=src/app.py", "--comment_id=discussion-42", "why this?"],
+         "--file_name=src/app.py", "--comment_id=discussion-42", "--origin_comment_id=99", "why this?"],
     )]
 
 
@@ -1115,7 +1161,7 @@ async def test_gitlab_manual_feedback_on_draft_is_unaffected(gitlab_webhook_modu
 
 
 @pytest.mark.parametrize(
-    "line_range, expected_start, expected_end, expected_side",
+    "line_range, expected_start, expected_end, expected_side, expected_start_side",
     [
         (
             {
@@ -1125,6 +1171,7 @@ async def test_gitlab_manual_feedback_on_draft_is_unaffected(gitlab_webhook_modu
             10,
             12,
             "RIGHT",
+            None,
         ),
         (
             {
@@ -1134,6 +1181,7 @@ async def test_gitlab_manual_feedback_on_draft_is_unaffected(gitlab_webhook_modu
             9,
             11,
             "LEFT",
+            None,
         ),
         (
             {
@@ -1143,11 +1191,72 @@ async def test_gitlab_manual_feedback_on_draft_is_unaffected(gitlab_webhook_modu
             10,
             12,
             "RIGHT",
+            None,
+        ),
+        (
+            {
+                "start": {"type": None, "old_line": 48, "new_line": 10},
+                "end": {"type": "old", "old_line": 49, "new_line": None},
+            },
+            10,
+            49,
+            "LEFT",
+            "RIGHT",
+        ),
+        (
+            {
+                "start": {"type": "old", "old_line": 49, "new_line": None},
+                "end": {"type": None, "old_line": 50, "new_line": 12},
+            },
+            49,
+            12,
+            "RIGHT",
+            "LEFT",
+        ),
+        (
+            {
+                "start": {"type": None, "old_line": 48, "new_line": 10},
+                "end": {"type": "new", "old_line": None, "new_line": 11},
+            },
+            10,
+            11,
+            "RIGHT",
+            None,
+        ),
+        (
+            {
+                "start": {"type": "old", "old_line": 49, "new_line": None},
+                "end": {"type": "new", "old_line": None, "new_line": 12},
+            },
+            49,
+            12,
+            "RIGHT",
+            "LEFT",
+        ),
+        (
+            {
+                "start": {"type": "old", "old_line": 9, "new_line": 10},
+                "end": {"type": "old", "old_line": 11, "new_line": 12},
+            },
+            9,
+            11,
+            "LEFT",
+            None,
+        ),
+        (
+            {
+                "start": {"type": "new", "old_line": None, "new_line": 11},
+                "end": {"type": "old", "old_line": 50, "new_line": None},
+            },
+            11,
+            50,
+            "LEFT",
+            "RIGHT",
         ),
     ],
 )
 def test_gitlab_handle_ask_line_selects_line_numbers_and_side_from_line_range(
-    gitlab_webhook_module, line_range, expected_start, expected_end, expected_side
+    gitlab_webhook_module, line_range, expected_start, expected_end, expected_side, expected_start_side
 ):
     data = {
         "object_attributes": {
@@ -1162,17 +1271,94 @@ def test_gitlab_handle_ask_line_selects_line_numbers_and_side_from_line_range(
 
     body = gitlab_webhook_module.handle_ask_line("/ask why this change?", data)
 
-    assert body == (
-        [
-            "/ask_line",
-            f"--line_start={expected_start}",
-            f"--line_end={expected_end}",
-            f"--side={expected_side}",
-            "--file_name=new/src/app.py",
-            "--comment_id=disc-1",
-            "why this change?",
-        ]
+    expected = [
+        "/ask_line",
+        f"--line_start={expected_start}",
+        f"--line_end={expected_end}",
+        f"--side={expected_side}",
+        "--file_name=new/src/app.py",
+        "--comment_id=disc-1",
+        "why this change?",
+    ]
+    if expected_start_side is not None:
+        expected.insert(4, f"--start_side={expected_start_side}")
+    assert body == expected
+
+
+def test_gitlab_handle_ask_line_mixed_side_range_selects_full_replacement(gitlab_webhook_module):
+    from pr_agent.algo.git_patch_processing import extract_hunk_lines_from_patch
+
+    patch = "@@ -48,4 +10,4 @@\n ctx\n-old_a\n-old_b\n+new_a\n+new_b\n ctx2"
+    data = {
+        "object_attributes": {
+            "discussion_id": "disc-1",
+            "position": {
+                "new_path": "src/app.py",
+                "old_path": "src/app.py",
+                "line_range": {
+                    "start": {"type": "old", "old_line": 49, "new_line": None},
+                    "end": {"type": "new", "old_line": None, "new_line": 12},
+                },
+            },
+        }
+    }
+
+    body = gitlab_webhook_module.handle_ask_line("/ask why replaced?", data)
+    params = dict(arg.split("=", 1) for arg in body[1:-1])
+    hunk, selected = extract_hunk_lines_from_patch(
+        patch,
+        params["--file_name"],
+        params["--line_start"],
+        params["--line_end"],
+        params["--side"],
+        start_side=params.get("--start_side"),
     )
+
+    assert "@@ -48,4 +10,4 @@" in hunk
+    assert selected == "-old_a\n-old_b\n+new_a\n+new_b"
+
+
+def test_gitlab_handle_ask_line_mixed_side_skips_pre_hunk_file_headers(gitlab_webhook_module):
+    from pr_agent.algo.git_patch_processing import extract_hunk_lines_from_patch
+
+    patch = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-old\n"
+        "+new\n"
+        " ctx"
+    )
+    data = {
+        "object_attributes": {
+            "discussion_id": "disc-1",
+            "position": {
+                "new_path": "src/app.py",
+                "old_path": "src/app.py",
+                "line_range": {
+                    "start": {"type": "old", "old_line": 1, "new_line": None},
+                    "end": {"type": "new", "old_line": None, "new_line": 1},
+                },
+            },
+        }
+    }
+
+    body = gitlab_webhook_module.handle_ask_line("/ask why replaced?", data)
+    params = dict(arg.split("=", 1) for arg in body[1:-1])
+    hunk, selected = extract_hunk_lines_from_patch(
+        patch,
+        params["--file_name"],
+        params["--line_start"],
+        params["--line_end"],
+        params["--side"],
+        start_side=params.get("--start_side"),
+    )
+
+    assert "@@ -1,2 +1,2 @@" in hunk
+    assert "--- a/src/app.py" not in hunk
+    assert selected == "-old\n+new"
 
 
 def test_gitlab_handle_ask_line_only_strips_leading_ask_command(gitlab_webhook_module):

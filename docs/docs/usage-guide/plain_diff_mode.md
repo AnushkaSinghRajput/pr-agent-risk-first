@@ -30,7 +30,7 @@ python -m pr_agent.cli --diff-file changes.diff --output review.md review
 | `--stdin` | Read a unified diff from stdin |
 | `--diff-file <path>` | Read a unified diff from a file |
 | `--output <path>` | Write Markdown produced by a compatible Plain Diff command to a file in addition to stdout |
-| `--json-output <path>` | Write structured results and token usage for `review`, `describe`, `improve`, or `generate_labels` (including aliases; also available with `--pr_url`) |
+| `--json-output <path>` | Write structured results and token usage for `review`, `describe`, `ask`, or `generate_labels` (including aliases; `improve` runs `review`; also available with `--pr_url`) |
 
 `--stdin` and `--diff-file` are mutually exclusive. At least one must be provided to
 enter plain-diff mode; omitting both falls back to the normal `--pr_url` flow.
@@ -38,31 +38,31 @@ Output options must appear before the command. For example, use
 `--stdin --output result.md review`, not `--stdin review --output result.md`.
 The Markdown and JSON output paths must point to different files.
 
-You can also save structured results from a local description or code-suggestion run:
+You can also save structured results from a local description or label run:
 
 ```bash
 python -m pr_agent.cli --diff-file changes.diff --json-output description.json describe
-python -m pr_agent.cli --diff-file changes.diff --json-output suggestions.json improve
 python -m pr_agent.cli --diff-file changes.diff --json-output labels.json generate_labels
 ```
 
 These files contain the parsed model result and a `usage` object, while the normal
 Markdown output remains available on stdout. The `usage` object is empty when
-token usage is unavailable. When all files are excluded, `improve` writes an empty
-suggestions list; `describe` reports failure instead of claiming a description was generated.
+token usage is unavailable. When all files are excluded, `describe` reports failure instead of claiming a description was generated.
 For `generate_labels`, JSON contains only allowlisted model-generated label suggestions,
 not existing human-applied PR labels.
 
 ### Supported commands
 
-`review`, `improve`, `describe`, and `ask` are supported, along with their
-`review_pr`, `improve_code`, `describe_pr`, and `ask_question` aliases.
+`review`, `describe`, and `ask` are supported, along with their
+`review_pr`, `describe_pr`, and `ask_question` aliases. `improve` and `improve_code` run `review`.
 `generate_labels` also works with raw diffs and can write its filtered labels as JSON.
+`update_changelog` can generate a changelog draft to stdout (`--output` is not supported for it),
+but cannot read or update an existing repository changelog file in this mode.
 Because there is no hosting
-platform to push to, `improve` renders its code suggestions as a single markdown
-document to stdout (and to `--output`, if given) instead of as committable inline
-suggestions. Commands that require live platform interaction (such as
-`update_changelog` or `similar_issue`) are not meaningful in this mode.
+platform to push to, `review` writes its findings, including any fixes, as a single markdown
+document to stdout (and to `--output`, if given), with each fix as a text block in the
+summary, instead of as committable inline suggestions. Commands that require live platform interaction (such as
+`similar_issue`) are not meaningful in this mode.
 
 By default, `describe` uses `Local diff review` as the title in stdout and `--output`;
 set `pr_description.generate_ai_title=true` to use an AI-generated title.
@@ -81,8 +81,7 @@ python -m pr_agent.cli --diff-file changes.diff review \
   --plain_diff.description="Invoices above the limit need manager approval."
 ```
 
-`ask` and `describe` also use the supplied title and description; `improve`
-uses the title, but its suggestion prompts do not use the description. These
+`ask` and `describe` also use the supplied title and description. These
 optional command arguments need no configuration file changes or enable flag.
 Without them, the title remains `Local diff review` and the description remains
 empty. Supplying a description may increase model input tokens for commands
@@ -105,13 +104,15 @@ that use it, but does not add model requests.
 4. **Output** — the result is written to stdout. If `--output <path>` is given, it is
    also written to that file (UTF-8, overwritten on each run). Both Markdown outputs
    remove ASCII control characters in the C0 range while preserving tabs and line breaks.
-   With `--json-output <path>`, `review`/`review_pr` writes the parsed review, token
+   With `--json-output <path>`, `review`/`review_pr` (and `improve`/`improve_code`, which run it) writes the parsed review, token
    `usage`, and a `coverage` object listing omitted or clipped files.
-   `describe`/`describe_pr` writes the parsed description and `usage`;
-   `improve`/`improve_code` writes code suggestions and `usage` (an empty list
-   if no files remain after filtering).
+   `describe`/`describe_pr` writes the parsed description and `usage`.
+   `ask`/`ask_question` writes the `question`, `answer`, and `usage`, including a note when no diff is analyzable.
    `generate_labels` writes the filtered `labels` list and `usage`; it never
    combines existing user labels into that list.
+   With `--json-output`, a run whose command fails or that the request policy skips exits with status 1;
+   parser errors, such as an unreadable diff file or empty input, exit with status 2.
+   A skipped run (for example, `config.include_pr_labels` is set and a diff has no labels) writes no JSON file.
 
 No platform token, no PR URL, and no internet access are required for the diff processing
 step itself. An LLM API key is still needed unless you configure a local model.

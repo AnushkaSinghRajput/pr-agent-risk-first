@@ -10,6 +10,8 @@ import re
 import shutil  # noqa: F401  (module attribute asserted by tests)
 import stat
 import threading
+import uuid
+from functools import partial
 from urllib.parse import urlparse
 
 import aiohttp
@@ -18,6 +20,7 @@ import litellm
 import openai
 from litellm import acompletion
 from litellm.exceptions import MidStreamFallbackError
+from starlette_context import context
 from tenacity import RetryCallState, retry, retry_if_exception, wait_random_exponential
 
 try:
@@ -46,6 +49,7 @@ from pr_agent.algo import (
     GPT6_MODELS,
     GPT6_MODELS_WITHOUT_NONE_EFFORT,
     GPT6_OPENROUTER_ROUTING_SUFFIXES,
+    GPT6_PROVIDER_BRIDGE_MODELS,
     GPT6_SOL_TIER_MODELS,
     GROK_REASONING_EFFORT_LEVELS,
     STREAMING_REQUIRED_MODELS,
@@ -141,16 +145,29 @@ from pr_agent.algo.ai_handlers.litellm_helpers import (
     _response_field,
     get_repetition_penalty,
 )
+from pr_agent.algo.ai_handlers.openrouter_model_info import MODEL_CONTEXT_TIMEOUT, fetch_model_context
 from pr_agent.algo.instruction_context import append_protected_system_instructions
 from pr_agent.algo.prompt_fragments import render_skills_prefix
 from pr_agent.algo.run_details import _as_decimal_cost, record_ai_call
 from pr_agent.algo.run_output import get_version
 from pr_agent.algo.setting_utils import _as_bool_setting, normalize_setting_list
 from pr_agent.algo.skills_loader import get_skills_context
+from pr_agent.algo.token_budget import _gpt6_budget_model
 from pr_agent.algo.url_safety import with_safe_redirects
 from pr_agent.algo.utils import ReasoningEffort
 from pr_agent.config_loader import get_settings, get_verbosity_level, global_settings
 from pr_agent.log import get_logger
+
+
+def _message_logging_disabled(settings) -> bool:
+    """Do not let repository settings weaken a deployment-level logging opt-out."""
+    key = "LITELLM.TURN_OFF_MESSAGE_LOGGING"
+    return (
+        _as_bool_setting(global_settings.get(key, False), setting_name=key)
+        or (context.exists() and context.get("_pr_agent_host_message_logging_disabled", False))
+        or _as_bool_setting(settings.get(key, False), setting_name=key)
+    )
+
 
 MODEL_RETRIES = 2
 DEFAULT_NUM_RETRIES = 4
@@ -158,11 +175,13 @@ DEFAULT_NUM_RETRIES = 4
 MAX_RETRY_AFTER_SECONDS = 30
 # Lowest config.max_output_tokens honored; Bedrock Claude with thinking needs this much to answer.
 MIN_MAX_OUTPUT_TOKENS = 4096
+# Session id for requests without PR context; random so no repository data is sent.
+_PROCESS_SESSION_ID = f"pr-agent-{uuid.uuid4().hex}"
 _IMAGE_HEAD_TIMEOUT_SECONDS = 5
 _IMAGE_NOT_ALIVE_MESSAGE = (
     "The image link is not [alive](img_path).\n"
     "Please repost the original image as a comment, and send the question again with 'quote reply' "
-    "(see [instructions](https://docs.pr-agent.ai/tools/ask/#ask-on-images))."
+    "(see [instructions](https://docs.pr-agent.ai/commands/ask/#ask-on-images))."
 )
 OPENAI_DEFAULT_API_BASE = "https://api.openai.com/v1"
 
@@ -196,6 +215,7 @@ PROVIDER_SETTING_PATHS = {
     "mistral": {"api_key": "MISTRAL.KEY"},
     "moonshot": {"api_key": "MOONSHOT.KEY", "api_base": "MOONSHOT.API_BASE"},
     "ollama": {"api_key": "OLLAMA.API_KEY", "api_base": "OLLAMA.API_BASE"},
+    "opencode_go": {"api_key": "OPENCODE_GO.KEY"},
     "openrouter": {"api_key": "OPENROUTER.KEY", "api_base": "OPENROUTER.API_BASE"},
     "replicate": {"api_key": "REPLICATE.KEY"},
     "sambanova": {"api_key": "SAMBANOVA.KEY"},
@@ -529,6 +549,9 @@ class LiteLLMAIHandler(BaseAiHandler):
                     ).hexdigest()
                     self._vertex_credentials = json.dumps(vertex_info)
         self._provider_request_params = self._snapshot_provider_request_params(settings)
+        self._model_context_cache = {}
+        self._model_context_failures = {}
+        self._model_context_lock = asyncio.Lock()
         self._snowflake_account_id = os.environ.get("SNOWFLAKE_ACCOUNT_ID", "")
         self._provider_environment_api_keys = self._snapshot_provider_environment_api_keys()
         self._volcengine_ark_api_key = os.environ.get("ARK_API_KEY")
@@ -581,6 +604,12 @@ class LiteLLMAIHandler(BaseAiHandler):
 
         if global_settings.get("LITELLM.DISABLE_AIOHTTP", False):
             litellm.disable_aiohttp_transport = True
+        # LiteLLM prints a "Give Feedback / Get Help" banner to stdout for every mapped provider error.
+        if _as_bool_setting(
+            global_settings.get("LITELLM.SUPPRESS_DEBUG_INFO", True),
+            default=True, setting_name="LITELLM.SUPPRESS_DEBUG_INFO",
+        ):
+            litellm.suppress_debug_info = True
         self._initialize_aws_request_credentials(settings)
         # LiteLLM callbacks are process globals, so only deployment settings may set them.
         if global_settings.get("LITELLM.SUCCESS_CALLBACK", None):
@@ -590,10 +619,12 @@ class LiteLLMAIHandler(BaseAiHandler):
         if global_settings.get("LITELLM.SERVICE_CALLBACK", None):
             litellm.service_callback = normalize_setting_list(global_settings.litellm.service_callback)
         # litellm callbacks attach full prompt and response content unless message logging is disabled.
-        if settings.get("LITELLM.TURN_OFF_MESSAGE_LOGGING", False):
+        if _message_logging_disabled(settings):
             litellm.turn_off_message_logging = True
         # Keep LiteLLM request spans separate from pr-agent command spans when both OTEL layers are enabled.
-        if self._litellm_otel_callback_enabled() and settings.get("OTEL.IS_ENABLED", False):
+        if self._litellm_otel_callback_enabled() and _as_bool_setting(
+            settings.get("OTEL.IS_ENABLED", False), setting_name="OTEL.IS_ENABLED"
+        ):
             os.environ.setdefault("USE_OTEL_LITELLM_REQUEST_SPAN", "true")
         repetition_penalty = get_repetition_penalty()
         if repetition_penalty is not None:
@@ -1426,7 +1457,7 @@ class LiteLLMAIHandler(BaseAiHandler):
         """Return the supported native GPT-6 model name without changing gateway model IDs."""
         if model.startswith(("azure_ai/", "aiohttp_openai/")):
             provider_model = model.split("/", 1)[1].removesuffix("_thinking")
-            return provider_model if provider_model in GPT6_SOL_TIER_MODELS else None
+            return provider_model if provider_model in GPT6_PROVIDER_BRIDGE_MODELS else None
         model = _strip_openai_azure_prefixes(model).removesuffix("_thinking")
         return model if model in GPT6_MODELS else None
 
@@ -1437,7 +1468,7 @@ class LiteLLMAIHandler(BaseAiHandler):
             return "max_tokens"
         if (
             provider not in (None, "openai", "azure", "azure_ai", "openrouter")
-            and cls._gpt6_model_name(model) in GPT6_SOL_TIER_MODELS
+            and cls._gpt6_model_name(model) in GPT6_PROVIDER_BRIDGE_MODELS
         ):
             return "max_tokens"
         if model.startswith("openrouter/"):
@@ -1454,6 +1485,36 @@ class LiteLLMAIHandler(BaseAiHandler):
         model_base = _strip_openai_azure_prefixes(model.removeprefix("openrouter/"))
         return model_base.startswith("gpt-5")
 
+    def _captured_terra_api_base(self, model: str, custom_llm_provider: str) -> str | None:
+        """Use the endpoint selected at initialization, including OpenAI's native default."""
+        provider = self._resolve_configured_request_provider(model, custom_llm_provider)
+        params = getattr(self, "_provider_request_params", {})
+        provider_params = params.get(provider or "openai", {})
+        base = provider_params.get("api_base")
+        if (
+            provider == "openrouter"
+            and not provider_params
+            and not self._provider_environment_api_keys.get("openrouter")
+        ):
+            openai_params = {} if self._openai_api_base_is_azure else params.get("openai", {})
+            if openai_params.get("api_base") and (
+                openai_params.get("api_key") or self._provider_environment_api_keys.get("openai")
+            ):
+                base = openai_params["api_base"]
+        return base or (OPENAI_DEFAULT_API_BASE if provider == "openai" else None)
+
+    def _is_custom_terra_gateway(self, model: str, custom_llm_provider: str) -> bool:
+        if custom_llm_provider not in ("", "openai", "aiohttp_openai", "azure", "azure_ai", "openrouter"):
+            return False
+        candidate = model.rsplit(":", 1)[0] if model.endswith(GPT6_OPENROUTER_ROUTING_SUFFIXES) else model
+        if self._gpt6_model_name(candidate.removeprefix("openrouter/")) != "gpt-6.1-terra":
+            return False
+        model_base, native = _gpt6_budget_model(
+            model, get_settings(), custom_llm_provider,
+            route_api_base=self._captured_terra_api_base(model, custom_llm_provider),
+        )
+        return model_base == "gpt-6.1-terra" and not native
+
     def _normalize_gpt5_model_for_request(self, model: str, user_model: str, custom_llm_provider: str) -> str:
         """Normalize GPT-5/GPT-6 suffixes and prefixes before request parameters are selected."""
         if model.startswith("openrouter/") or custom_llm_provider == "openrouter":
@@ -1462,21 +1523,25 @@ class LiteLLMAIHandler(BaseAiHandler):
                 routed_model = routed_model.rsplit(":", 1)[0]
             gpt6_model = self._gpt6_model_name(routed_model)
             if gpt6_model:
-                if custom_llm_provider not in ("", "openrouter") and gpt6_model in GPT6_SOL_TIER_MODELS:
+                if custom_llm_provider not in ("", "openrouter") and gpt6_model in GPT6_PROVIDER_BRIDGE_MODELS:
+                    return model
+                if self._is_custom_terra_gateway(model, custom_llm_provider):
                     return model
                 return model.replace("_thinking", "", 1)
             if model.startswith("openrouter/"):
                 return model
+        if self._is_custom_terra_gateway(model, custom_llm_provider):
+            return model
         if custom_llm_provider and (
             custom_llm_provider in ("azure_text", "text-completion-openai")
             or self._resolve_configured_request_provider(model, custom_llm_provider) not in (
                 "openai", "azure", "azure_ai"
             )
-        ) and self._gpt6_model_name(model) in GPT6_SOL_TIER_MODELS:
+        ) and self._gpt6_model_name(model) in GPT6_PROVIDER_BRIDGE_MODELS:
             return model
         if (
             model.startswith(("azure_ai/", "aiohttp_openai/"))
-            and self._gpt6_model_name(model) in GPT6_SOL_TIER_MODELS
+            and self._gpt6_model_name(model) in GPT6_PROVIDER_BRIDGE_MODELS
         ):
             return model.replace("_thinking", "")
         model_base = _strip_openai_azure_prefixes(model)
@@ -2032,6 +2097,37 @@ class LiteLLMAIHandler(BaseAiHandler):
             )
             return False
 
+    @classmethod
+    def _openrouter_gemini_supports_reasoning(cls, model: str) -> bool:
+        """Probe ``gemini/`` and ``vertex_ai/`` metadata for scoped OpenRouter Google models.
+
+        LiteLLM's bundled cost map has no bare, ``google/``, or ``openrouter/``
+        entries for Gemini 4 ids; their reasoning metadata lives under ``gemini/``
+        and ``vertex_ai/``. Callers invoke this only when the resolved request
+        provider is OpenRouter, so non-OpenRouter overrides and bare direct
+        Gemini 4 ids stay off the reasoning path.
+        """
+        if not model.startswith("openrouter/"):
+            return False
+        segments = model.removeprefix("openrouter/").split("/")
+        if (
+            len(segments) != 2
+            or segments[0] != "google"
+            or segments[-1] not in cls._GEMINI_LOW_FLOOR_CEILING
+        ):
+            return False
+        bare = segments[-1]
+        try:
+            return any(
+                cls._model_cost_entry_supports_reasoning(candidate)
+                for candidate in (f"gemini/{bare}", f"vertex_ai/{bare}")
+            )
+        except Exception as e:
+            get_logger().warning(
+                f"Failed to probe litellm reasoning metadata for {model}: {e}"
+            )
+            return False
+
     @staticmethod
     def _litellm_supports_temperature(
         model: str,
@@ -2106,20 +2202,39 @@ class LiteLLMAIHandler(BaseAiHandler):
         normalized = model.lower().replace("_", "-").replace(".", "-")
         return re.search(r"claude(?:-|$)", normalized) is not None
 
-    @staticmethod
-    def _uses_gemini_low_reasoning_floor(model: str) -> bool:
-        """Return whether Gemini reasoning needs a supported-level floor."""
+    _GEMINI_LOW_FLOOR_CEILING: dict[str, str] = {
+        "gemini-3.7-flash": "high",
+        "gemini-3.8-flash": "high",
+        "gemini-4-argon": "high",
+        "gemini-4-hydrogen": "xhigh",
+    }
+
+    @classmethod
+    def _gemini_reasoning_ceiling_for(cls, model: str) -> str | None:
+        """Return the highest documented thinking level for a low-floor Gemini model.
+
+        These ids omit ``minimal`` (clamped to ``low`` on the direct path) and
+        ``none`` (clamped to ``low`` on the OpenRouter path), and cap upper
+        reasoning efforts at the returned ceiling.
+        """
         normalized_model = model.rsplit(":", 1)[0] if model.startswith("openrouter/") else model
-        return any(
-            normalized_model == gemini_id or normalized_model.endswith("/" + gemini_id)
-            for gemini_id in ("gemini-3.7-flash", "gemini-3.8-flash")
-        )
+        for gemini_id, ceiling in cls._GEMINI_LOW_FLOOR_CEILING.items():
+            if normalized_model == gemini_id or normalized_model.endswith("/" + gemini_id):
+                return ceiling
+        return None
 
     @classmethod
     def _clamp_gemini_reasoning_effort(cls, model: str, reasoning_effort: str) -> str:
-        """Map unsupported Gemini 3.x ``minimal`` effort to the nearest level."""
-        if cls._uses_gemini_low_reasoning_floor(model) and reasoning_effort == "minimal":
+        """Clamp unsupported Gemini reasoning efforts to the model's documented bounds."""
+        ceiling = cls._gemini_reasoning_ceiling_for(model)
+        if ceiling is None:
+            return reasoning_effort
+        if reasoning_effort == "minimal":
             return "low"
+        if reasoning_effort == "max":
+            return ceiling
+        if reasoning_effort == "xhigh" and ceiling == "high":
+            return "high"
         return reasoning_effort
 
     @staticmethod
@@ -2183,9 +2298,19 @@ class LiteLLMAIHandler(BaseAiHandler):
             )
             reasoning_effort = clamped_effort
 
-        if reasoning_effort == "none" and cls._uses_gemini_low_reasoning_floor(model):
-            get_logger().info(f"Gemini model {model} does not support reasoning_effort='none'; using 'low' instead.")
-            reasoning_effort = "low"
+        gemini_ceiling = cls._gemini_reasoning_ceiling_for(model)
+        if gemini_ceiling is not None:
+            if reasoning_effort == "none":
+                get_logger().info(
+                    f"Gemini model {model} does not support reasoning_effort='none'; using 'low' instead."
+                )
+                reasoning_effort = "low"
+            elif reasoning_effort == "max" or (reasoning_effort == "xhigh" and gemini_ceiling == "high"):
+                get_logger().info(
+                    f"Gemini model {model} does not support reasoning_effort="
+                    f"'{reasoning_effort}'; using '{gemini_ceiling}' instead."
+                )
+                reasoning_effort = gemini_ceiling
         return reasoning_effort
 
     @classmethod
@@ -2218,7 +2343,7 @@ class LiteLLMAIHandler(BaseAiHandler):
             return reasoning_effort
 
     def _resolve_reasoning_effort(self, model: str, configured_effort) -> str:
-        """Validate a configured reasoning effort and clamp it to this model's Grok levels."""
+        """Validate a configured reasoning effort and clamp it to this model's supported levels."""
         reasoning_effort = self._validate_reasoning_effort(configured_effort)
         clamped_effort = self._clamp_grok_reasoning_effort(model, reasoning_effort)
         clamped_effort = self._clamp_gemini_reasoning_effort(model, clamped_effort)
@@ -2379,6 +2504,27 @@ class LiteLLMAIHandler(BaseAiHandler):
             )
         return extended_thinking_budget_tokens, extended_thinking_max_output_tokens
 
+    @staticmethod
+    def _custom_reasoning_model() -> bool:
+        """Read config.custom_reasoning_model as a bool, so a string "false" stays off."""
+        return _as_bool_setting(
+            get_settings().config.custom_reasoning_model, setting_name="CONFIG.CUSTOM_REASONING_MODEL"
+        )
+
+    @staticmethod
+    def _configured_seed() -> int:
+        """Return config.seed as an int; -1 (no seed) when it is not a number."""
+        value = get_settings().config.get("seed", -1)
+        # int() turns True into 1 and -0.5 into 0, which would switch a fixed seed on
+        if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+            get_logger().warning(f"Ignoring invalid config.seed: {value!r}")
+            return -1
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            get_logger().warning(f"Ignoring invalid config.seed: {value!r}")
+            return -1
+
     @classmethod
     def _configured_max_output_tokens(cls) -> int:
         """Return config.max_output_tokens, warning about values that would unset or undercut the cap."""
@@ -2416,6 +2562,106 @@ class LiteLLMAIHandler(BaseAiHandler):
                     else openrouter_output_tokens
                 )
         return max(0, output_tokens)
+
+    def _openrouter_context_route(self, model: str) -> tuple[str, str] | None:
+        """Identify the captured official route without promoting gateways or late credentials."""
+        if type(self) is not LiteLLMAIHandler:
+            return None
+        params = getattr(self, "_provider_request_params", {}).get("openrouter", {})
+        base = params.get("api_base")
+        if not isinstance(base, str) or not re.fullmatch(r"(?ai:https://openrouter\.ai)(?::443)?/api/v1/?", base):
+            return None
+        provider_setting = self._custom_llm_provider
+        routed = self._route_model_for_request(model, provider_setting, self.deployment_id)
+        provider = self._resolve_configured_request_provider(routed, provider_setting)
+        completion_model = self._normalize_gpt5_model_for_request(routed, model, provider_setting)
+        canonical = self._canonical_openrouter_model(completion_model, provider)
+        return (base, canonical) if canonical is not None else None
+
+    async def _load_openrouter_context(self, model: str, route: tuple[str, str]) -> int | None:
+        from pr_agent.algo.token_budget import _resolve_max_tokens
+
+        base, canonical_model = route
+        lookup = partial(
+            litellm.get_model_info, custom_llm_provider="openrouter", api_base=base,
+            api_key=self._captured_api_key("openrouter"),
+        )
+        sdk_limit = await asyncio.to_thread(
+            _resolve_max_tokens, model, True, custom_llm_provider="openrouter", model_info_lookup=lookup,
+            route_api_base=base,
+        )
+        if sdk_limit is not None:
+            return sdk_limit
+        return await fetch_model_context(canonical_model.removeprefix("openrouter/"))
+
+    async def prepare_model_token_limits(self, model: str) -> None:
+        """Prepare one request-scoped metadata result before synchronous budgeting."""
+        from pr_agent.algo.token_budget import FallbackEligibleError, _resolve_max_tokens
+
+        route = self._openrouter_context_route(model)
+        if route is None:
+            return
+        # Caller-specific SDK alias sequences can differ on the same request route.
+        cache_key = (*route, model)
+        # Built-in, custom and alias priorities remain first and require no metadata request.
+        local_limit = _resolve_max_tokens(
+            model, True, custom_llm_provider="openrouter", model_info_lookup=lambda _: None,
+            route_api_base=route[0],
+        )
+        if local_limit is not None:
+            return
+        if cache_key in self._model_context_cache:
+            return
+        # Share a failed attempt with current waiters, while allowing a later call to retry.
+        failure_epoch = self._model_context_failures.get(cache_key, (0, None))[0]
+        async with self._model_context_lock:
+            if cache_key not in self._model_context_cache:
+                latest_epoch, failure = self._model_context_failures.get(cache_key, (0, None))
+                if latest_epoch != failure_epoch and failure is not None:
+                    raise failure
+                try:
+                    async with asyncio.timeout(MODEL_CONTEXT_TIMEOUT):
+                        window = await self._load_openrouter_context(model, route)
+                except (TimeoutError, FallbackEligibleError) as error:
+                    self._model_context_failures[cache_key] = (latest_epoch + 1, error)
+                    if isinstance(error, TimeoutError):
+                        get_logger().info("OpenRouter model context preparation timed out")
+                    raise
+                self._model_context_cache[cache_key] = window
+                self._model_context_failures.pop(cache_key, None)
+
+    def get_model_token_limits(self, model: str, *, ignore_max_model_tokens: bool = False) -> tuple[int, int | None]:
+        """Use prepared limits, retaining the legacy SDK lookup for unprepared callers."""
+        from pr_agent.algo import token_budget
+
+        route = self._openrouter_context_route(model)
+        provider_options = (
+            {"custom_llm_provider": "openrouter", "route_api_base": route[0]} if route is not None else {}
+        )
+        if route is None and token_budget._gpt6_budget_model(
+            model, get_settings(), self._custom_llm_provider
+        )[0] == "gpt-6.1-terra":
+            routed_model = self._route_model_for_request(model, self._custom_llm_provider, self.deployment_id)
+            request_provider = self._resolve_configured_request_provider(routed_model, self._custom_llm_provider)
+            provider_options = {
+                "custom_llm_provider": self._custom_llm_provider or request_provider or "",
+                "route_api_base": self._captured_terra_api_base(routed_model, self._custom_llm_provider),
+            }
+        cache_key = (*route, model) if route is not None else None
+        if cache_key is not None and cache_key in self._model_context_cache:
+            prepared_window = self._model_context_cache[cache_key]
+            # Reuse limit precedence and caps without querying SDK metadata again.
+            window = token_budget._resolve_max_tokens(
+                model, ignore_max_model_tokens, **provider_options,
+                model_info_lookup=lambda _: {"max_input_tokens": prepared_window},
+            )
+            if window is None:
+                token_budget._raise_unresolved_model_limit(model)
+        else:
+            window = token_budget.get_max_tokens(
+                model, ignore_max_model_tokens=ignore_max_model_tokens, **provider_options,
+            )
+        return window, token_budget.get_max_input_tokens(model, **provider_options)
 
     def get_output_token_limit(self, model: str) -> int:
         """Return the output cap that this handler will request for the supplied model."""
@@ -2476,7 +2722,7 @@ class LiteLLMAIHandler(BaseAiHandler):
         system_prompt = append_protected_system_instructions(system_prompt)
         combine_prompts = (
             self._uses_user_message_only(model)
-            or get_settings().config.custom_reasoning_model
+            or self._custom_reasoning_model()
         )
         if combine_prompts:
             user_prompt = f"{system_prompt}\n\n\n{user_prompt}"
@@ -2684,7 +2930,7 @@ class LiteLLMAIHandler(BaseAiHandler):
             return ""
         # Cap the individual values before serialization, so the result stays
         # valid JSON: slicing the serialized string could cut through closing
-        # quotes and braces. 30 chars cover every tool command; 200 chars of
+        # quotes and braces. 30 chars cover every command; 200 chars of
         # pr_url keep the total under 256 with the JSON overhead.
         for key, max_len in (("command", 30), ("pr_url", 200)):
             value = context.get(key)
@@ -2692,26 +2938,53 @@ class LiteLLMAIHandler(BaseAiHandler):
                 context[key] = value[:max_len]
         return json.dumps(context, separators=(",", ":"))
 
+    def _add_request_session_id(self, kwargs: dict) -> None:
+        """Group every command run against the same PR into one LiteLLM session.
+
+        Sends the proxy's session id header and passes the same value as
+        litellm_session_id. Explicitly configured headers win, so an operator
+        can override the value.
+        """
+        if not _as_bool_setting(
+            get_settings().litellm.get("add_session_id_to_requests", False),
+            setting_name="LITELLM.ADD_SESSION_ID_TO_REQUESTS",
+        ):
+            return
+        headers = dict(kwargs.get("headers") or {})
+        session_id = next(
+            (value for name, value in headers.items() if name.lower() == "x-litellm-session-id"), None,
+        )
+        if session_id is None:
+            session_id = self._get_request_session_id()
+            headers["x-litellm-session-id"] = session_id
+            kwargs["headers"] = headers
+        # The SDK derives provider session headers, such as OpenCode Go's
+        # required x-opencode-session, from this parameter, not the proxy header.
+        # Reusing an explicit header keeps the proxy and the provider on one session.
+        kwargs["litellm_session_id"] = session_id
+
     def _get_request_session_id(self) -> str:
-        """Build a stable LiteLLM session id for the current PR.
+        """Build a stable LiteLLM session id.
 
         LiteLLM stores this value in the session_id column of its spend logs, so
         every command run against the same PR shares one session. The header only
         accepts alphanumerics, hyphens and underscores, so the URL is normalized
-        to that character set. Returns an empty string when no PR context exists.
+        to that character set. Without PR context (doctor pings, health probes)
+        returns a per-process id, since providers such as OpenCode Go reject
+        requests without one.
         """
         context = self._capture_log_context(
             "session_id_probe", "Capturing the request context for the session id",
         )
         pr_url = context.get("pr_url")
         if not isinstance(pr_url, str) or not pr_url:
-            return ""
+            return _PROCESS_SESSION_ID
         parsed = urlparse(pr_url)
         raw = f"{parsed.netloc.rpartition('@')[2]}{parsed.path}" if parsed.netloc else pr_url
         slug = re.sub(r"[^A-Za-z0-9_-]+", "-", raw)
         slug = re.sub(r"-{2,}", "-", slug).strip("-_").lower()
         if not slug:
-            return ""
+            return _PROCESS_SESSION_ID
         # Different URLs can normalize to the same slug, and long repository
         # paths can push the PR number past the cutoff. Append a digest of the
         # raw URL and reserve room for it before truncating the readable part,
@@ -2729,6 +3002,36 @@ class LiteLLMAIHandler(BaseAiHandler):
         Returns the deployment ID for the OpenAI API.
         """
         return get_settings().get("OPENAI.DEPLOYMENT_ID", None)
+
+    def prompt_cache_active(self, model: str, *, prompt_tokens: int | None = None) -> bool:
+        """Whether the shared-prefix prompt cache will apply to this model's calls.
+
+        The chunk runners stagger their first call when it is, so sibling chunks read
+        the cache entry the first one writes instead of each writing their own (#4876).
+        Uses the same gates as the request path: injection points configured, a model
+        that honors them, and — when the caller knows the shared prompt's token count —
+        a prefix that clears the model's ``prompt_cache_min_tokens``. Below that
+        minimum Anthropic silently does not cache, so staggering would only add
+        latency. Best effort like the call-time warning: a missing token count or a
+        metadata gap skips the length check, never the call.
+        """
+        points = self._resolve_cache_control_injection_points()
+        # A role: user or index: -1 point caches through the chunk's own diff, so
+        # siblings can never read it and the stagger only adds latency; gate on a
+        # system point to keep it to the shared prefix.
+        if not any(isinstance(point, dict) and point.get("role") == "system" for point in points or []):
+            return False
+        if not self._is_claude_model(model):
+            return False
+        if prompt_tokens is not None:
+            try:
+                min_tokens = litellm.get_model_info(model).get("prompt_cache_min_tokens")
+            except Exception:
+                return True
+            if isinstance(min_tokens, int) and not isinstance(min_tokens, bool) and min_tokens > 0:
+                if prompt_tokens < min_tokens:
+                    return False
+        return True
 
     @staticmethod
     def _resolve_cache_control_injection_points():
@@ -2787,10 +3090,10 @@ class LiteLLMAIHandler(BaseAiHandler):
     def _split_system_prompt_for_skills_cache(self, messages: list[dict], model: str, injection_points) -> None:
         """Add a cache breakpoint at the end of the shared skills prefix (#4007).
 
-        The review tools open their system prompts with an identical skills block, so marking
+        The review commands open their system prompts with an identical skills block, so marking
         that block lets Anthropic read one cache entry across /review, /describe and /improve
-        instead of writing one per tool. The tool-specific remainder keeps its own breakpoint
-        rather than losing it, so a tool that repeats still reads its whole system prompt; the
+        instead of writing one per command. The command-specific remainder keeps its own breakpoint
+        rather than losing it, so a command that repeats still reads its whole system prompt; the
         price is a second breakpoint slot of the four Anthropic allows, not a smaller cache.
         Only applies to Anthropic Claude models when a configured injection point targets the
         system message and the rendered prefix matches; every other request keeps the plain
@@ -2953,6 +3256,9 @@ class LiteLLMAIHandler(BaseAiHandler):
         *,
         configured_deployment_id: str | None,
     ):
+        # This LiteLLM setting must cover PR-Agent's own diagnostics as well as
+        # LiteLLM callbacks; otherwise DEBUG logs still contain the full diff.
+        hide_message_logs = _message_logging_disabled(get_settings())
         # Validate config-derived kwargs before the try/except below, so a malformed value raises a
         # ValueError config error instead of being wrapped as openai.APIError and retried.
         cache_control_injection_points = self._resolve_cache_control_injection_points()
@@ -3023,14 +3329,16 @@ class LiteLLMAIHandler(BaseAiHandler):
                 gpt6_model = self._gpt6_model_name(family_model.removeprefix("openrouter/"))
                 preserved_gpt6_alias = (
                     bool(openrouter_model) and family_model.endswith("_thinking")
-                    and gpt6_model in GPT6_SOL_TIER_MODELS
+                    and gpt6_model in GPT6_PROVIDER_BRIDGE_MODELS
                 )
+                bridge_model = gpt6_model or family_model.rsplit("/", 1)[-1].removesuffix("_thinking")
+                terra_gateway_route = self._is_custom_terra_gateway(family_model, custom_llm_provider)
                 non_native_gpt6_model = (
                     (request_provider not in ("openai", "azure", "azure_ai", "openrouter")
                      or custom_llm_provider in ("azure_text", "text-completion-openai")
-                     or family_model.startswith(("azure_text/", "text-completion-openai/")))
-                    and (gpt6_model or family_model.rsplit("/", 1)[-1].removesuffix("_thinking"))
-                    in GPT6_SOL_TIER_MODELS
+                     or family_model.startswith(("azure_text/", "text-completion-openai/"))
+                     or terra_gateway_route)
+                    and bridge_model in GPT6_PROVIDER_BRIDGE_MODELS
                 )
                 if non_native_gpt6_model or preserved_gpt6_alias:
                     gpt6_model = None
@@ -3051,7 +3359,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                             f"{gpt6_model} does not support reasoning_effort='{effort}'; using 'low'"
                         )
                         effort = ReasoningEffort.LOW.value
-                    elif gpt6_model in GPT6_SOL_TIER_MODELS and request_provider in ("azure", "azure_ai") and (
+                    elif gpt6_model in GPT6_PROVIDER_BRIDGE_MODELS and request_provider in ("azure", "azure_ai") and (
                         effort == ReasoningEffort.MAX.value
                     ):
                         get_logger().info(f"{gpt6_model} on Azure Chat Completions uses 'xhigh' instead of 'max'")
@@ -3108,9 +3416,11 @@ class LiteLLMAIHandler(BaseAiHandler):
 
                     if openrouter_model:
                         openrouter_reasoning_effort = effort
-                    elif gpt6_model in GPT6_SOL_TIER_MODELS and (
-                        effort == ReasoningEffort.XHIGH.value
-                        or (request_provider in ("azure", "azure_ai") and effort == ReasoningEffort.NONE.value)
+                    elif (
+                        (gpt6_model in GPT6_SOL_TIER_MODELS and effort == ReasoningEffort.XHIGH.value)
+                        or (gpt6_model in GPT6_PROVIDER_BRIDGE_MODELS
+                            and request_provider in ("azure", "azure_ai")
+                            and effort == ReasoningEffort.NONE.value)
                     ):
                         # LiteLLM's bundled fallback map lacks these models and rejects xhigh/azure-none.
                         thinking_kwargs_gpt5 = {"extra_body": {"reasoning_effort": effort}}
@@ -3122,7 +3432,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                     model_family = "GPT-6" if is_gpt6_model else "GPT-5"
                     get_logger().info(f"Using reasoning_effort='{effort}' for {model_family} model")
                 # Currently, some models do not support a separate system and user prompts
-                if self._uses_user_message_only(model) or get_settings().config.custom_reasoning_model:
+                if self._uses_user_message_only(model) or self._custom_reasoning_model():
                     user = f"{system}\n\n\n{user}"
                     system = ""
                     get_logger().info(f"Using model {model}, combining system and user prompts")
@@ -3156,7 +3466,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # probe's own bare-model resolution; the api key snapshot itself is
                 # untouched (see the guard tests).
                 if (
-                    not get_settings().config.custom_reasoning_model
+                    not self._custom_reasoning_model()
                     and not any(
                         candidate == no_temp_model or candidate.endswith("/" + no_temp_model)
                         for candidate in (model, capability_model)
@@ -3192,12 +3502,57 @@ class LiteLLMAIHandler(BaseAiHandler):
                     (reasoning_model, reasoning_model.removesuffix("_thinking"))
                     if non_native_gpt6_model and not preserved_gpt6_alias else (reasoning_model,)
                 )
+                terra_reasoning_support = None
+                if non_native_gpt6_model and bridge_model == "gpt-6.1-terra":
+                    legacy_completion_route = (
+                        request_provider in ("azure_text", "text-completion-openai")
+                        or custom_llm_provider in ("azure_text", "text-completion-openai")
+                        or (not custom_llm_provider and family_model.startswith((
+                            "azure_text/", "text-completion-openai/",
+                        )))
+                    )
+                    if legacy_completion_route:
+                        terra_reasoning_support = False
+                    else:
+                        routed_alias = (reasoning_model.rsplit(":", 1)[0]
+                                        if reasoning_model.endswith(GPT6_OPENROUTER_ROUTING_SUFFIXES)
+                                        else reasoning_model)
+                        alias_provider = custom_llm_provider or request_provider
+                        provider_alias = (
+                            routed_alias if not alias_provider or routed_alias.startswith(f"{alias_provider}/")
+                            else f"{alias_provider}/{routed_alias}"
+                        )
+                        aliases = (reasoning_model, routed_alias, provider_alias)
+                        if alias_provider and not reasoning_model.startswith(f"{alias_provider}/"):
+                            aliases = (provider_alias, *aliases)
+                        terra_reasoning_support = False
+                        for alias in dict.fromkeys(aliases):
+                            # A gateway's capabilities cannot be inferred from native Terra metadata.
+                            if alias in (
+                                "gpt-6.1-terra", "openai/gpt-6.1-terra", "azure/gpt-6.1-terra",
+                                "azure_ai/gpt-6.1-terra", "openrouter/gpt-6.1-terra",
+                                "openrouter/openai/gpt-6.1-terra",
+                            ):
+                                continue
+                            entry = litellm.model_cost.get(alias)
+                            if isinstance(entry, dict) and "supports_reasoning" in entry:
+                                terra_reasoning_support = entry["supports_reasoning"] is True
+                                break
                 if not (is_gpt5_model or is_gpt6_model) and (
                     self._grok_reasoning_levels_for(reasoning_model) is not None
-                    or not non_native_gpt6_model
-                    and not preserved_gpt6_alias
+                    or not (non_native_gpt6_model and bridge_model in GPT6_SOL_TIER_MODELS)
+                    and (not preserved_gpt6_alias or terra_reasoning_support is True)
                     and not self._is_claude_family_model(reasoning_model)
-                    and self._litellm_supports_reasoning(reasoning_model)
+                    and (
+                        (
+                            self._litellm_supports_reasoning(reasoning_model)
+                            or (
+                                bool(openrouter_model)
+                                and self._openrouter_gemini_supports_reasoning(reasoning_model)
+                            )
+                        )
+                        if terra_reasoning_support is None else terra_reasoning_support
+                    )
                     or any(
                         candidate == m or candidate.endswith("/" + m)
                         for candidate in reasoning_aliases for m in self.additional_reasoning_effort_models
@@ -3214,6 +3569,8 @@ class LiteLLMAIHandler(BaseAiHandler):
                     else:
                         get_logger().info(f"Adding reasoning_effort with value {reasoning_effort} to model {model}.")
                         kwargs["reasoning_effort"] = reasoning_effort
+                        if non_native_gpt6_model and bridge_model == "gpt-6.1-terra":
+                            kwargs.pop("temperature", None)
                         # Whitelist reasoning_effort through allowed_openai_params when
                         # LiteLLM omits it from the params it reports for unknown or
                         # OpenAI-compatible gateway-prefixed model IDs. Merge into any
@@ -3268,13 +3625,17 @@ class LiteLLMAIHandler(BaseAiHandler):
                         else request_provider
                     )
                     kwargs.setdefault(
-                        self._output_token_limit_param(capability_model, output_limit_provider), max_output_tokens
+                        "max_tokens" if terra_gateway_route else self._output_token_limit_param(
+                            capability_model, output_limit_provider
+                        ), max_output_tokens
                     )
 
-                if get_settings().litellm.get("enable_callbacks", False):
+                if _as_bool_setting(
+                    get_settings().litellm.get("enable_callbacks", False), setting_name="LITELLM.ENABLE_CALLBACKS"
+                ):
                     kwargs = self.add_litellm_callbacks(kwargs)
 
-                seed = get_settings().config.get("seed", -1)
+                seed = self._configured_seed()
                 if temperature > 0 and seed >= 0:
                     raise ValueError(f"Seed ({seed}) is not supported with temperature ({temperature}) > 0")
                 elif seed >= 0:
@@ -3287,33 +3648,19 @@ class LiteLLMAIHandler(BaseAiHandler):
                 # Support for custom OpenAI body fields (e.g., Flex Processing)
                 kwargs = _process_litellm_extra_body(kwargs)
 
-                # Group every command run against the same PR into one LiteLLM
-                # session by sending the proxy's session id header. Explicitly
-                # configured headers win, so an operator can override the value.
-                if get_settings().litellm.get("add_session_id_to_requests", False):
-                    session_id = self._get_request_session_id()
-                    if session_id:
-                        headers = dict(kwargs.get("headers") or {})
-                        if not any(name.lower() == "x-litellm-session-id" for name in headers):
-                            headers["x-litellm-session-id"] = session_id
-                            kwargs["headers"] = headers
-
                 # Optional provider-side request attribution: when config.add_user_to_requests
                 # is enabled, send the current command and PR URL in the OpenAI-compatible
                 # "user" field, so provider logs and usage exports can be attributed to a
                 # specific PR without timestamp correlation (OpenRouter shows it as
                 # "external_user" and includes it in the activity export). Disabled by
                 # default: it shares request-attribution data with the model provider.
-                if get_settings().config.get("add_user_to_requests", False):
+                if _as_bool_setting(
+                    get_settings().config.get("add_user_to_requests", False),
+                    setting_name="CONFIG.ADD_USER_TO_REQUESTS",
+                ):
                     request_user = self._get_request_user_field()
                     if request_user:
-                        try:
-                            supported_params = litellm.get_supported_openai_params(model=model) or []
-                        except Exception:
-                            supported_params = []
-                        if "user" in supported_params:
-                            kwargs["user"] = request_user
-                        elif openrouter_model:
+                        if openrouter_model:
                             # LiteLLM's OpenRouter transformation does not forward the
                             # standard "user" parameter; extra_body reaches the
                             # OpenAI-compatible request body verbatim.
@@ -3321,12 +3668,33 @@ class LiteLLMAIHandler(BaseAiHandler):
                             user_extra_body["user"] = request_user
                             kwargs["extra_body"] = user_extra_body
                         else:
-                            # Providers whose parameter mapping does not accept "user"
-                            # (e.g. gemini, deepseek) would reject the request when
-                            # litellm.drop_params is off: skip the field instead of
-                            # breaking the call.
-                            get_logger().debug(
-                                f"add_user_to_requests: user field unsupported for {model}, skipped")
+                            user_param_provider = (
+                                custom_llm_provider
+                                or self._resolve_request_transport_provider(routed_model)
+                                or request_provider
+                                or None
+                            )
+                            user_param_model = (
+                                model.removeprefix(f"{user_param_provider}/")
+                                if user_param_provider and model.startswith(f"{user_param_provider}/")
+                                else model
+                            )
+                            try:
+                                supported_params = litellm.get_supported_openai_params(
+                                    model=user_param_model,
+                                    custom_llm_provider=user_param_provider,
+                                ) or []
+                            except Exception:
+                                supported_params = []
+                            if "user" in supported_params:
+                                kwargs["user"] = request_user
+                            else:
+                                # Providers whose parameter mapping does not accept "user"
+                                # (e.g. gemini, deepseek) would reject the request when
+                                # litellm.drop_params is off: skip the field instead of
+                                # breaking the call.
+                                get_logger().debug(
+                                    f"add_user_to_requests: user field unsupported for {model}, skipped")
 
                 # Anthropic prompt caching via LiteLLM's cache_control_injection_points. The value
                 # is validated before the try/except (see above) so a malformed config surfaces as
@@ -3369,11 +3737,12 @@ class LiteLLMAIHandler(BaseAiHandler):
                         openrouter_reasoning_effort,
                     )
 
-                get_logger().debug("Prompts", artifact={"system": system, "user": user})
+                if not hide_message_logs:
+                    get_logger().debug("Prompts", artifact={"system": system, "user": user})
 
-                if get_verbosity_level() >= 2:
-                    get_logger().info(f"\nSystem prompt:\n{system}")
-                    get_logger().info(f"\nUser prompt:\n{user}")
+                    if get_verbosity_level() >= 2:
+                        get_logger().info(f"\nSystem prompt:\n{system}")
+                        get_logger().info(f"\nUser prompt:\n{user}")
 
                 # Optional fixed provider override, so a raw hosted model id reaches the
                 # provider unchanged instead of being rewritten by LiteLLM's prefix inference.
@@ -3439,15 +3808,27 @@ class LiteLLMAIHandler(BaseAiHandler):
         # touches no os.environ credentials, and in IMDS mode the lock serializes
         # every concurrent call, so holding it through logging and cost pricing
         # would make each waiting coroutine pay for them serially.
-        get_logger().debug(f"\nAI response:\n{resp}")
+        if not hide_message_logs:
+            get_logger().debug(f"\nAI response:\n{resp}")
 
-        # log the full response for debugging
-        response_log = self.prepare_logs(response_obj, system, user, resp, finish_reason)
-        get_logger().debug("Full_response", artifact=response_log)
+            # Log the full response only when diagnostic message logging is enabled.
+            response_log = self.prepare_logs(response_obj, system, user, resp, finish_reason)
+            get_logger().debug("Full_response", artifact=response_log)
 
-        # for CLI debugging
-        if get_verbosity_level() >= 2:
-            get_logger().info(f"\nAI response:\n{resp}")
+            # for CLI debugging
+            if get_verbosity_level() >= 2:
+                get_logger().info(f"\nAI response:\n{resp}")
+        elif (
+            context.exists()
+            and context.get("_pr_agent_cli_invocation", False)
+            and get_verbosity_level() >= 2
+            and not _as_bool_setting(
+                get_settings().config.get("publish_output", True), default=True,
+                setting_name="CONFIG.PUBLISH_OUTPUT",
+            )
+        ):
+            # Keep trusted local CLI output separate from diagnostic logging sinks.
+            print(f"\nAI response:\n{resp}")
 
         self._record_completion_metadata(response_obj, model=model, display_model=user_model)
 
@@ -3476,11 +3857,14 @@ class LiteLLMAIHandler(BaseAiHandler):
             capability_model = self._canonical_openrouter_model(completion_model, request_provider) or completion_model
             if request_provider == "openrouter" and capability_model.endswith((":nitro", ":floor")):
                 capability_model = capability_model.rsplit(":", 1)[0]
-            output_limit_param = self._output_token_limit_param(
-                capability_model,
-                custom_llm_provider
-                if custom_llm_provider in ("azure_text", "text-completion-openai")
-                else request_provider,
+            output_limit_param = (
+                "max_tokens" if self._is_custom_terra_gateway(capability_model, custom_llm_provider)
+                else self._output_token_limit_param(
+                    capability_model,
+                    custom_llm_provider
+                    if custom_llm_provider in ("azure_text", "text-completion-openai")
+                    else request_provider,
+                )
             )
             kwargs = {
                 "model": completion_model,
@@ -3583,6 +3967,8 @@ class LiteLLMAIHandler(BaseAiHandler):
     ):
         """Call LiteLLM with any provider compatibility context scoped to this task."""
         _completion = _completion or acompletion
+        # Every completion, including health probes and doctor pings, passes here.
+        self._add_request_session_id(kwargs)
         if getattr(self, "_drop_params", None):
             kwargs.setdefault("drop_params", self._drop_params)
         custom_llm_provider = str(kwargs.get("custom_llm_provider") or "").strip().lower()

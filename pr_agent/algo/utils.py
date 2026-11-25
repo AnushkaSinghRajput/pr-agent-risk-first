@@ -40,7 +40,8 @@ from pr_agent.algo.git_patch_processing import (
 )
 from pr_agent.algo.i18n import t
 from pr_agent.algo.language_handler import build_language_file_matcher
-from pr_agent.algo.output_models import PRType, SubPR, parse_failure_modes
+from pr_agent.algo.merge_verdict import render_merge_recommendation_checks
+from pr_agent.algo.output_models import PRType, SubPR, finding_confidence, parse_failure_modes
 from pr_agent.algo.structural_reach import render_structural_reach
 from pr_agent.algo.types import FilePatchInfo
 from pr_agent.config_loader import get_bot_display_name, get_settings, get_verbosity_level
@@ -206,11 +207,21 @@ def replace_suggestion_blocks(body: str, replacement: str) -> str:
     return "".join(parts)
 
 
+def get_min_finding_confidence() -> float:
+    """Return pr_reviewer.min_finding_confidence as a number; 0 (disabled) when unset, not numeric or outside 0-10."""
+    try:
+        threshold = float(get_settings().pr_reviewer.get("min_finding_confidence", 0))
+    except (TypeError, ValueError):
+        return 0
+    return threshold if 0 < threshold <= 10 else 0
+
+
 def convert_to_markdown_v2(output_data: dict,
                            gfm_supported: bool = True,
                            incremental_review=None,
                            git_provider=None,
-                           files=None) -> str:
+                           files=None,
+                           commit_review=None) -> str:
     """
     Convert a dictionary of data into markdown format.
     Args:
@@ -241,8 +252,10 @@ def convert_to_markdown_v2(output_data: dict,
         "Review priority files": "📂",
     }
     markdown_text = ""
-    markdown_text += f"{_ci.format_pr_review_header(incremental=bool(incremental_review))}\n\n"
-    if incremental_review:
+    markdown_text += f"{_ci.format_pr_review_header(incremental=bool(incremental_review or commit_review))}\n\n"
+    if commit_review:
+        markdown_text += f"🔂 Review of commit {commit_review}.\n\n"
+    elif incremental_review:
         bot_display_name = get_bot_display_name()
         markdown_text += f"⏮️ Review for commits since previous {bot_display_name} review {incremental_review}.\n\n"
     if not output_data or not output_data.get('review', {}):
@@ -291,11 +304,10 @@ def convert_to_markdown_v2(output_data: dict,
                 else:
                     markdown_text += f"{emoji}&nbsp;<strong>{t('review.contains_tests')}</strong>"
                 markdown_text += "</td></tr>\n"
+            elif is_value_no(value):
+                markdown_text += f"### {emoji} {t('review.no_relevant_tests')}\n\n"
             else:
-                if is_value_no(value):
-                    markdown_text += f"### {emoji} {t('review.no_relevant_tests')}\n\n"
-                else:
-                    markdown_text += f"### {emoji} {t('review.contains_tests')}\n\n"
+                markdown_text += f"### {emoji} {t('review.contains_tests')}\n\n"
         elif 'ticket compliance check' in key_nice.lower():
             markdown_text = ticket_markdown_logic(emoji, markdown_text, value, gfm_supported)
         elif 'contribution time cost estimate' in key_nice.lower():
@@ -329,18 +341,19 @@ def convert_to_markdown_v2(output_data: dict,
                     value = _ci.emphasize_header(value.strip()) if isinstance(value, str) else _ci.as_review_text(value)
                     markdown_text += f"{value}"
                 markdown_text += "</td></tr>\n"
+            elif is_value_no(value):
+                markdown_text += f"### {emoji} {t('review.no_security_concerns')}\n\n"
             else:
-                if is_value_no(value):
-                    markdown_text += f"### {emoji} {t('review.no_security_concerns')}\n\n"
-                else:
-                    markdown_text += f"### {emoji} {t('review.security_concerns')}\n\n"
-                    value = _ci.emphasize_header(
-                        value.strip(), only_markdown=True) if isinstance(value, str) else _ci.as_review_text(value)
-                    markdown_text += f"{value}\n\n"
+                markdown_text += f"### {emoji} {t('review.security_concerns')}\n\n"
+                value = _ci.emphasize_header(
+                    value.strip(), only_markdown=True) if isinstance(value, str) else _ci.as_review_text(value)
+                markdown_text += f"{value}\n\n"
         elif key.lower() == 'structural_reach':
             markdown_text += render_structural_reach(value, gfm_supported)
         elif key.lower() in ('risk_checks', 'deterministic_risk'):
             markdown_text += render_risk_checks(value, gfm_supported)
+        elif key.lower() == 'merge_recommendation_checks':
+            markdown_text += render_merge_recommendation_checks(value, gfm_supported)
         elif 'risk level' in key_nice.lower():
             risk_value = str(value).strip().lower().replace("_", " ")
             risk_display = risk_value.capitalize() if risk_value else "Unknown"
@@ -425,14 +438,13 @@ def convert_to_markdown_v2(output_data: dict,
                         markdown_text += f"<li>{priority_file}</li>\n"
                     markdown_text += "</ul>\n"
                 markdown_text += "</td></tr>\n"
+            elif not priority_files:
+                markdown_text += f"### {emoji} Priority files: None\n\n"
             else:
-                if not priority_files:
-                    markdown_text += f"### {emoji} Priority files: None\n\n"
-                else:
-                    markdown_text += f"### {emoji} Priority files\n\n"
-                    for priority_file in priority_files:
-                        markdown_text += f"- {priority_file}\n"
-                    markdown_text += "\n"
+                markdown_text += f"### {emoji} Priority files\n\n"
+                for priority_file in priority_files:
+                    markdown_text += f"- {priority_file}\n"
+                markdown_text += "\n"
         elif 'todo sections' in key_nice.lower():
             if gfm_supported:
                 markdown_text += "<tr><td>"
@@ -443,13 +455,12 @@ def convert_to_markdown_v2(output_data: dict,
                     markdown_text += f"{emoji}&nbsp;<strong>TODO sections</strong>\n<br><br>\n"
                     markdown_text += markdown_todo_items
                 markdown_text += "</td></tr>\n"
+            elif is_value_no(value):
+                markdown_text += "### ✅ No TODO sections\n\n"
             else:
-                if is_value_no(value):
-                    markdown_text += "### ✅ No TODO sections\n\n"
-                else:
-                    markdown_todo_items = format_todo_items(value, git_provider, gfm_supported)
-                    markdown_text += f"### {emoji} TODO sections\n\n"
-                    markdown_text += markdown_todo_items
+                markdown_todo_items = format_todo_items(value, git_provider, gfm_supported)
+                markdown_text += f"### {emoji} TODO sections\n\n"
+                markdown_text += markdown_todo_items
         elif 'can be split' in key_nice.lower():
             if gfm_supported:
                 markdown_text += "<tr><td>"
@@ -487,9 +498,12 @@ def convert_to_markdown_v2(output_data: dict,
                         if issue_header.lower() == 'possible bug':
                             issue_header = t('review.possible_issue')  # Make the header less frightening
                         issue_content = issue.get('issue_content', '').strip()
+                        confidence = finding_confidence(issue) if get_min_finding_confidence() > 0 else None
+                        if confidence is not None:
+                            issue_header = f"{issue_header} (confidence: {confidence:g})"
                         start_line = _as_line(issue.get('start_line')) or 0
                         end_line = _as_line(issue.get('end_line')) or start_line
-                        valid_lines = start_line > 0 and end_line >= start_line
+                        valid_lines = 0 < start_line <= end_line
                         if git_provider and valid_lines:
                             reference_link = git_provider.get_line_link(relevant_file, start_line, end_line)
                         else:
@@ -513,11 +527,22 @@ def convert_to_markdown_v2(output_data: dict,
                                     )
                             else:
                                 issue_str = f"<strong>{issue_header}</strong><br>{issue_content}"
+                        elif reference_link is not None and len(reference_link) > 0:
+                            issue_str = f"[**{issue_header}**]({reference_link})\n\n{issue_content}\n\n"
                         else:
-                            if reference_link is not None and len(reference_link) > 0:
-                                issue_str = f"[**{issue_header}**]({reference_link})\n\n{issue_content}\n\n"
+                            issue_str = f"**{issue_header}**\n\n{issue_content}\n\n"
+                        improved_code = issue.get('improved_code')
+                        if isinstance(improved_code, str) and improved_code.strip():
+                            fix = improved_code.rstrip()
+                            fence = get_suggestion_fence(fix)
+                            fix_block = f"{fence}text\n{fix}\n{fence}"
+                            if gfm_supported:
+                                issue_str += (
+                                    f"\n\n<details><summary>{t('review.suggested_fix')}</summary>\n\n"
+                                    f"{fix_block}\n\n</details>"
+                                )
                             else:
-                                issue_str = f"**{issue_header}**\n\n{issue_content}\n\n"
+                                issue_str += f"**{t('review.suggested_fix')}**\n\n{fix_block}\n\n"
                         markdown_text += f"{issue_str}\n\n"
                     except Exception as e:
                         get_logger().exception(f"Failed to process 'Recommended focus areas for review': {e}")
@@ -641,16 +666,15 @@ def ticket_markdown_logic(emoji, markdown_text, value, gfm_supported) -> str:
                 # Calculate individual ticket compliance level
                 if fully_compliant_str:
                     if not_compliant_str:
-                        ticket_compliance_level = 'Partially compliant'
+                        ticket_compliance_level = "Partially compliant"
+                    elif not requires_further_human_verification:
+                        ticket_compliance_level = "Fully compliant"
                     else:
-                        if not requires_further_human_verification:
-                            ticket_compliance_level = 'Fully compliant'
-                        else:
-                            ticket_compliance_level = 'PR Code Verified'
+                        ticket_compliance_level = "PR Code Verified"
                 elif not_compliant_str:
-                    ticket_compliance_level = 'Not compliant'
+                    ticket_compliance_level = "Not compliant"
                 elif requires_further_human_verification:
-                    ticket_compliance_level = 'PR Code Verified'
+                    ticket_compliance_level = "PR Code Verified"
 
                 # Store the compliance level for aggregation
                 if ticket_compliance_level:
@@ -851,7 +875,7 @@ def update_settings_from_args(args: list[str]) -> list[str]:
     Args:
         args: A list of arguments passed to the function.
         Example args: ['--pr_code_suggestions.extra_instructions="be funny',
-                  '--pr_code_suggestions.num_code_suggestions_per_chunk=3']
+                  '--pr_reviewer.num_max_findings=3']
 
     Returns:
         None
@@ -1080,6 +1104,103 @@ def _has_yaml_c_loader_risk(response_text: str) -> bool:
     return False
 
 
+class _YamlScanWindow:
+    """Expose a bounded portion of a shared seekable stream to the YAML scanner."""
+
+    def __init__(self, stream, end):
+        self.stream = stream
+        self.end = end
+
+    def read(self, size=-1):
+        remaining = max(0, self.end - self.stream.tell())
+        return self.stream.read(remaining if size < 0 else min(size, remaining))
+
+
+def _extract_labelled_yaml_block(response_text: str) -> str | None:
+    """Extract the last nonempty mapping in a labelled YAML fence amid prose."""
+    lines = response_text.split('\n')
+    offsets = []
+    offset = 0
+    for line in lines:
+        offsets.append(offset)
+        offset += len(line) + 1
+    stream = StringIO(response_text)
+    text_end = len(response_text)
+    i = 0
+    last_candidate = None
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        if not (stripped.startswith('```yaml') or stripped.startswith('```yml')):
+            i += 1
+            continue
+
+        scan_offset = min(text_end, offsets[i] + len(line) + 1)
+        first_fence = i + 1
+        while first_fence < n and lines[first_fence].strip() != '```':
+            first_fence += 1
+        if first_fence < n:
+            window_end = min(text_end, offsets[first_fence] + len(lines[first_fence]) + 1)
+        else:
+            window_end = text_end
+
+        while True:
+            stream.seek(scan_offset)
+            scalar_spans = []
+            try:
+                scalar_spans.extend(
+                    (scan_offset + token.start_mark.index, scan_offset + token.end_mark.index)
+                    for token in yaml.scan(_YamlScanWindow(stream, window_end), Loader=yaml.SafeLoader)
+                    if isinstance(token, ScalarToken) and token.style in ('|', '>', "'", '"')
+                )
+            except yaml.YAMLError as error:
+                # An unfinished quoted scalar may contain the candidate fence. At a
+                # temporary boundary, keep it open until a wider scan decides it.
+                if (window_end < text_end and getattr(error, 'context', None) == 'while scanning a quoted scalar'
+                        and getattr(error, 'problem', None) == 'found unexpected end of stream'
+                        and getattr(error, 'context_mark', None) is not None):
+                    scalar_spans.append((scan_offset + error.context_mark.index, window_end + 1))
+                else:
+                    get_logger().debug("YAML scan ended at non-YAML content; keeping preceding scalar spans")
+
+            j = i + 1
+            fence_depth = 1
+            span_index = 0
+            while j < n and (offsets[j] < window_end or window_end == text_end):
+                j_stripped = lines[j].strip()
+                while span_index < len(scalar_spans) and offsets[j] >= scalar_spans[span_index][1]:
+                    span_index += 1
+                in_scalar = (span_index < len(scalar_spans)
+                             and scalar_spans[span_index][0] < offsets[j] < scalar_spans[span_index][1])
+                if j_stripped.startswith('```') and j_stripped != '```':
+                    fence_depth += 1
+                elif j_stripped == '```' and (fence_depth > 1 or not in_scalar):
+                    fence_depth -= 1
+                    if fence_depth == 0:
+                        break
+                j += 1
+            if j < n and offsets[j] < window_end and fence_depth == 0:
+                break
+            if window_end == text_end:
+                break
+            # Geometric growth keeps repeated scans linear even when thousands
+            # of fences are inside one long quoted or block scalar.
+            target = min(text_end, max(window_end + 1, scan_offset + 2 * (window_end - scan_offset)))
+            newline = response_text.find('\n', target)
+            window_end = text_end if newline < 0 else newline + 1
+
+        candidate = '\n'.join(lines[i + 1:j])
+        try:
+            parsed = yaml.safe_load(candidate)
+            if isinstance(parsed, dict) and parsed:
+                last_candidate = candidate
+        except Exception:
+            get_logger().debug("Labelled YAML block parse failed")
+        i = j + 1
+    return last_candidate
+
+
 def _load_yaml_initial(response_text: str) -> Any:
     """Parse initial YAML with LibYAML while preserving SafeLoader edge-case semantics."""
     if _YAML_C_SAFE_LOADER is None:
@@ -1103,7 +1224,7 @@ def _load_yaml_initial(response_text: str) -> Any:
 
 
 def load_yaml(response_text: str, keys_fix_yaml: list[str] | None = None, first_key="", last_key="",
-              *, preserve_null: bool = False) -> Any:
+              *, preserve_null: bool = False, suppress_diagnostics: bool = False) -> Any:
     """Parse model output, normalizing YAML null to {} unless preservation is requested."""
     if keys_fix_yaml is None:
         keys_fix_yaml = []
@@ -1135,18 +1256,39 @@ def load_yaml(response_text: str, keys_fix_yaml: list[str] | None = None, first_
             raise ValueError("Preprocessing/sanitization removed all content from a non-empty AI prediction")
         data = _load_yaml_initial(response_text)
     except Exception as e:
-        get_logger().warning(f"Initial failure to parse AI prediction: {e}")
+        if suppress_diagnostics:
+            get_logger().warning("Initial failure to parse AI prediction")
+        else:
+            get_logger().warning(f"Initial failure to parse AI prediction: {e}")
+        # The fence stripping above is anchored at the start of the response, so when
+        # the labelled YAML block sits mid-text (for example after a code example the
+        # model included for explanation), the surrounding prose and the other fence
+        # pairs defeat both the initial parse and the trailing-fence retry. Extract the
+        # labelled block's content directly before handing off to the repair pipeline.
+        labelled_block = _extract_labelled_yaml_block(response_text)
+        if labelled_block is not None:
+            try:
+                candidate = _load_yaml_initial(labelled_block)
+                if isinstance(candidate, dict) and candidate:
+                    get_logger().info("Recovered labelled YAML block embedded in prose")
+                    return candidate
+            except Exception as e:
+                if suppress_diagnostics:
+                    get_logger().debug("Mid-text YAML block parse failed")
+                else:
+                    get_logger().debug(f"Mid-text YAML block parse failed: {e}")
         separators = str.maketrans({"\u2028": " ", "\u2029": " "})
         response_text = response_text.translate(separators)
         response_text_original_sanitized = response_text_original_sanitized.translate(separators)
         data = try_fix_yaml(response_text, keys_fix_yaml=keys_fix_yaml, first_key=first_key, last_key=last_key,
-                            response_text_original=response_text_original_sanitized)
+                            response_text_original=response_text_original_sanitized,
+                            suppress_diagnostics=suppress_diagnostics)
         if not data:
             get_logger().error("Failed to parse AI prediction after fallbacks",
-                               artifact={'response_text': response_text})
+                               artifact={} if suppress_diagnostics else {'response_text': response_text})
         else:
             get_logger().info("Successfully parsed AI prediction after fallbacks",
-                              artifact={'response_text': response_text})
+                              artifact={} if suppress_diagnostics else {'response_text': response_text})
     if data is None and not preserve_null:
         return {}
     return data
@@ -1157,7 +1299,7 @@ def try_fix_yaml(response_text: str,
                  keys_fix_yaml: list[str] | None = None,
                  first_key="",
                  last_key="",
-                 response_text_original="") -> dict:
+                 response_text_original="", suppress_diagnostics: bool = False) -> dict:
     if keys_fix_yaml is None:
         keys_fix_yaml = []
     response_text_lines = response_text.split('\n')
@@ -1236,7 +1378,7 @@ def try_fix_yaml(response_text: str,
             get_logger().info("Successfully parsed AI prediction after replacing | with |2 and adding spaces")
             return data
     except Exception:
-        pass
+        get_logger().debug("YAML spacing fallback failed; trying the next recovery method")
 
     # second fallback - try to extract only range from first ```yaml to the last ```
     snippet_pattern = r'```[ \t]*(?:(?i:yaml|yml)[ \t]*)?\r?\n([\s\S]*?)```(?=\s*$|")'
@@ -1252,7 +1394,30 @@ def try_fix_yaml(response_text: str,
                 get_logger().info("Successfully parsed AI prediction after extracting yaml snippet")
                 return data
         except Exception as e:
-            get_logger().debug(f"Failed to parse AI prediction after extracting yaml snippet: {e}")
+            if suppress_diagnostics:
+                get_logger().debug("Failed to parse AI prediction after extracting yaml snippet")
+            else:
+                get_logger().debug(f"Failed to parse AI prediction after extracting yaml snippet: {e}")
+
+
+    # A preceding code example can make the generic fence match start at its
+    # closing fence. Retry the final explicitly labelled YAML block in that case.
+    yaml_fences = list(re.finditer(r'(?im)^```(?:yaml|yml)[ \t]*\r?\n', response_text_original))
+    if yaml_fences and response_text_original.rstrip().endswith('```'):
+        # Extract content between the last YAML fence and the final ```
+        fence_start = yaml_fences[-1].end()
+        fence_end = response_text_original.rfind('```')
+        if fence_end > fence_start:
+            snippet_text = response_text_original[fence_start:fence_end].rstrip()
+            try:
+                data = _parse_yaml(snippet_text)
+                if isinstance(data, dict) and data:
+                    return data
+            except Exception as e:
+                if suppress_diagnostics:
+                    get_logger().debug("Trailing labelled YAML fence retry failed")
+                else:
+                    get_logger().debug(f"Trailing labelled YAML fence retry failed: {e}")
 
 
     # third fallback - try to remove leading and trailing curly brackets
@@ -1452,9 +1617,22 @@ def set_custom_labels(variables, git_provider=None):
 def filter_generated_labels(labels: list[str]) -> list[str]:
     """Keep model-generated labels within the enabled vocabulary, not user labels."""
     names = [label.value for label in PRType]
+
+    def description_key(text: str) -> str:
+        # The prompt shows a description with its newlines and quotes escaped; a model may echo either form.
+        return " ".join(text.replace("\\n", " ").replace("\\'", "'").split()).lower()
+
+    by_description = {}
     if get_settings().config.get("enable_custom_labels", False):
         custom_labels = get_settings().get("custom_labels", {}) or _DEFAULT_CUSTOM_LABELS
         names.extend(str(label) for label in custom_labels)
+        if isinstance(custom_labels, dict):
+            for name, value in custom_labels.items():
+                description = value.get("description", "") if isinstance(value, dict) else str(value)
+                key = description_key(description) if isinstance(description, str) else ""
+                if key:
+                    # A description shared by several labels names none of them.
+                    by_description[key] = None if key in by_description else str(name)
     allowed = {name.lower() for name in names}
     # Resolve prompt enum keys (e.g. bug_fix) to allowed display names.
     aliases = {name.lower().replace(" ", "_"): name for name in names}
@@ -1465,6 +1643,9 @@ def filter_generated_labels(labels: list[str]) -> list[str]:
             accepted.append(label.strip())
         elif isinstance(label, str) and label.strip().lower() in aliases:
             accepted.append(aliases[label.strip().lower()])
+        # The prompt enum's value is the description, and a model may answer with it instead of the key.
+        elif isinstance(label, str) and (name := by_description.get(description_key(label))):
+            accepted.append(name)
         else:
             dropped.append(label)
     if dropped:
@@ -1670,6 +1851,10 @@ def is_value_no(value):
     return False
 
 
+FILE_WALKTHROUGH_ESCAPED_MARKER = "<!-- pr-agent:file-walkthrough-escaped -->"
+_WALKTHROUGH_BLANK_LINE = re.compile(r"\r?\n\r?\n")
+
+
 class _WalkthroughFileMatch:
     """Keep the capture offsets available to walkthrough readback consumers."""
 
@@ -1751,13 +1936,14 @@ def _match_walkthrough_file(file_data: str) -> _WalkthroughFileMatch | None:
         marker_end = marker + (len("<li>") if marker == li_start else len("•"))
         detail_start = marker_end
     else:
-        divider = file_data.find("\n\n", body_start, details_end) if paragraph_allowed else -1
-        if divider == -1 and paragraph_allowed:
+        divider = _WALKTHROUGH_BLANK_LINE.search(file_data, body_start, details_end) if paragraph_allowed else None
+        if divider is None and paragraph_allowed:
             # Recover the separator after <hr> when none follows the filename.
-            divider = file_data.rfind("\n\n", hr_end, body_start)
-        if divider != -1:
-            marker = divider
-            detail_start = divider + 2
+            for match in _WALKTHROUGH_BLANK_LINE.finditer(file_data, hr_end, body_start):
+                divider = match
+        if divider is not None:
+            marker = divider.start()
+            detail_start = divider.end()
         else:
             marker = file_data.find("-", body_start, details_end)
             if marker == -1:
@@ -1772,41 +1958,145 @@ def _match_walkthrough_file(file_data: str) -> _WalkthroughFileMatch | None:
     ))
 
 
+def _find_walkthrough_start(description: str) -> int | None:
+    """Find a walkthrough boundary, skipping fences, blockquotes, and single-line code."""
+    excluded = []
+    fence_char = ""
+    fence_length = 0
+    list_content_indent = 0
+    offset = 0
+    lines = description.split("\n")
+    # Ignore unclosed top-level fences so a following generated walkthrough remains readable.
+    closers = [{}] * len(lines)
+    longest = {"`": 0, "~": 0}
+    for index in range(len(lines) - 1, -1, -1):
+        closers[index] = dict(longest)
+        bare = lines[index].strip()
+        if bare[:1] in longest and not bare.strip(bare[0]):
+            longest[bare[0]] = max(longest[bare[0]], len(bare))
+    for line_index, line in enumerate(lines):
+        expanded_line = line.expandtabs(4)
+        delimiter = expanded_line.lstrip(" ")
+        indent = len(expanded_line) - len(delimiter)
+        nonblank = bool(delimiter.strip())
+        # End an unclosed fence when its enclosing list item ends.
+        if fence_char and list_content_indent and nonblank and indent < list_content_indent:
+            fence_char = ""
+            fence_length = 0
+            list_content_indent = 0
+        if not fence_char:
+            list_marker = re.match(r"(?:[-+*]|\d{1,9}[.)]) +", delimiter)
+            if list_marker and (indent <= 3 or 0 <= indent - list_content_indent <= 3):
+                list_content_indent = indent + list_marker.end()
+                delimiter = delimiter[list_marker.end():]
+                indent = list_content_indent
+            elif nonblank and indent < list_content_indent:
+                list_content_indent = 0
+        effective_indent = indent - list_content_indent if indent >= list_content_indent else indent
+        # Account for indentation inside list items and marker templates.
+        literal = bool(fence_char) or delimiter.startswith(">")
+        if effective_indent <= 3 and delimiter[:1] in ("`", "~"):
+            char = delimiter[0]
+            length = len(delimiter) - len(delimiter.lstrip(char))
+            if fence_char:
+                if char == fence_char and length >= fence_length and not delimiter[length:].strip():
+                    fence_char = ""
+            elif 3 <= length <= closers[line_index][char] and (char != "`" or "`" not in delimiter[length:]):
+                fence_char, fence_length = char, length
+                literal = True
+        if literal:
+            excluded.append((offset, offset + len(line) + 1))
+        else:
+            # Pair equal-length backtick runs, leaving unmatched runs as prose.
+            runs = list(re.finditer(r"`+", line))
+            runs_by_length = {}
+            for index, run in enumerate(runs):
+                runs_by_length.setdefault(len(run.group()), []).append(index)
+            index = 0
+            while index < len(runs):
+                opener = runs[index]
+                same_length = runs_by_length[len(opener.group())]
+                next_same = bisect.bisect_right(same_length, index)
+                if next_same == len(same_length):
+                    index += 1
+                    continue
+                closer_index = same_length[next_same]
+                excluded.append((offset + opener.start(), offset + runs[closer_index].end()))
+                index = closer_index + 1
+        offset += len(line) + 1
+
+    excluded_starts = [start for start, _ in excluded]
+    comments = []
+    # Keep outer comments around nested escaped-file markers without hiding a later real walkthrough.
+    comment_stack = []
+    comment_line_index = 0
+    comment_line_end = len(lines[0])
+    standalone_line = lines[0].strip() == "-->"
+    comment_start = description.find("<!--")
+    comment_end = description.find("-->")
+    while comment_start != -1 or comment_end != -1:
+        if comment_start != -1 and (comment_end == -1 or comment_start < comment_end):
+            if not comment_stack:
+                previous = bisect.bisect_right(excluded_starts, comment_start) - 1
+                if previous >= 0 and comment_start < excluded[previous][1]:
+                    comment_start = description.find("<!--", comment_start + 4)
+                    continue
+            if comment_stack:
+                comment_stack[-1][1] = True
+            comment_stack.append([comment_start, False])
+            comment_start = description.find("<!--", comment_start + 4)
+            continue
+        if comment_stack:
+            start, nested = comment_stack[-1]
+            # After a nested marker, require an explicit outer closer, not an arrow in file text.
+            if len(comment_stack) == 1 and nested:
+                # Advance once per line, including when many closers share one long line.
+                while comment_end > comment_line_end:
+                    comment_line_index += 1
+                    comment_line_end += len(lines[comment_line_index]) + 1
+                    standalone_line = lines[comment_line_index].strip() == "-->"
+            if len(comment_stack) > 1 or not nested or standalone_line:
+                comment_stack.pop()
+                if not comment_stack:
+                    previous = bisect.bisect_right(excluded_starts, start) - 1
+                    if previous < 0 or start >= excluded[previous][1]:
+                        comments.append((start, comment_end + 3))
+        comment_end = description.find("-->", comment_end + 3)
+    comment_starts = [start for start, _ in comments]
+    wrapper = (r"<details(?=[\s>])[^<>]*>\s*<summary>\s*<h3>\s*"
+               + re.escape(_ci.PRDescriptionHeader.FILE_WALKTHROUGH.value) + r"\s*</h3>\s*</summary>")
+    # Recognize marker templates by this table and a semantic file row without the outer wrapper.
+    table = (
+        re.escape('<table><thead><tr><th></th><th align="left">Relevant files</th></tr></thead><tbody>')
+        + r'<tr><td><strong>[^<>]*</strong></td><td>'
+        + r'(?:<details><summary>\d+ files</summary>)?<table>\s*<tr>\s*<td>\s*'
+        + r'(?:<details>\s*<summary>)?<strong>'
+    )
+    # Prefer the explicit wrapper; an earlier bare table may be user content.
+    # Keep the marker fallback at or after the former text boundary.
+    table_start = description.find(_ci.PRDescriptionHeader.FILE_WALKTHROUGH.value)
+    for pattern, start in ((wrapper, 0), (table, table_start)):
+        for match in re.compile(pattern).finditer(description, max(0, start)):
+            previous = bisect.bisect_right(excluded_starts, match.start()) - 1
+            comment_index = bisect.bisect_right(comment_starts, match.start()) - 1
+            if ((previous < 0 or match.start() >= excluded[previous][1]) and
+                    (comment_index < 0 or match.start() >= comments[comment_index][1])):
+                return match.start()
+    return None
+
+
 def process_description(description_full: str) -> tuple[str, list]:
     if not description_full:
         return "", []
+    if _ci.PRDescriptionHeader.FILE_WALKTHROUGH.value not in description_full:
+        return description_full.strip(), []
 
-    # description_split = description_full.split(_ci.PRDescriptionHeader.FILE_WALKTHROUGH.value)
-    if _ci.PRDescriptionHeader.FILE_WALKTHROUGH.value in description_full:
-        try:
-            # FILE_WALKTHROUGH are presented in a collapsible section in the description
-            regex_pattern = (r"<details.*?>\s*<summary>\s*<h3>\s*"
-                             + re.escape(_ci.PRDescriptionHeader.FILE_WALKTHROUGH.value) + r"\s*</h3>\s*</summary>")
-            description_split = re.split(regex_pattern, description_full, maxsplit=1, flags=re.DOTALL)
-
-            # If the regex pattern is not found, fallback to the previous method
-            if len(description_split) == 1:
-                get_logger().debug("Could not find regex pattern for file walkthrough, falling back to simple split")
-                description_split = description_full.split(_ci.PRDescriptionHeader.FILE_WALKTHROUGH.value, 1)
-        except Exception as e:
-            get_logger().warning(f"Failed to split description using regex, falling back to simple split: {e}")
-            description_split = description_full.split(_ci.PRDescriptionHeader.FILE_WALKTHROUGH.value, 1)
-
-        if len(description_split) < 2:
-            get_logger().error("Failed to split description into base and changes walkthrough",
-                               artifact={"description": description_full})
-            return description_full.strip(), []
-
-        base_description_str = description_split[0].strip()
-        changes_walkthrough_str = ""
-        files = []
-        if len(description_split) > 1:
-            changes_walkthrough_str = description_split[1]
-        else:
-            get_logger().debug("No changes walkthrough found")
-    else:
-        base_description_str = description_full.strip()
-        return base_description_str, []
+    walkthrough_start = _find_walkthrough_start(description_full)
+    if walkthrough_start is None:
+        return description_full.strip(), []
+    base_description_str = description_full[:walkthrough_start].strip()
+    changes_walkthrough_str = description_full[walkthrough_start:]
+    files = []
 
     try:
         if changes_walkthrough_str:
@@ -1831,10 +2121,25 @@ def process_description(description_full: str) -> tuple[str, list]:
                         file_data = file_data[0]
                     res = _match_walkthrough_file(file_data)
                     if res and res.lastindex == 4:
-                        short_filename = res.group(1).strip()
-                        short_summary = res.group(2).strip()
-                        long_filename = res.group(3).strip()
-                        if long_filename.endswith('<ul>'):
+                        raw_filename = res.group(3)
+                        marker_match = re.match(
+                            re.escape(FILE_WALKTHROUGH_ESCAPED_MARKER) + r"[ \t]*\r?\n", raw_filename
+                        )
+                        escaped = marker_match is not None
+                        if escaped:
+                            short_filename = html.unescape(res.group(1))
+                            short_summary = html.unescape(res.group(2))
+                            # New rows encode filename line breaks, so only the first physical line is a path.
+                            filename_end = raw_filename.find("\n", marker_match.end())
+                            if filename_end == -1:
+                                filename_end = len(raw_filename)
+                            encoded_filename = raw_filename[marker_match.end():filename_end].removesuffix("\r")
+                            long_filename = html.unescape(encoded_filename)
+                        else:
+                            short_filename = res.group(1).strip()
+                            short_summary = res.group(2).strip()
+                            long_filename = raw_filename.strip()
+                        if not escaped and long_filename.endswith('<ul>'):
                             long_filename = long_filename[:-4].strip()
                         long_summary =  res.group(4).strip()
                         long_summary = long_summary.replace('<br> *', '\n*').replace('<br>','').replace('\n','<br>')
@@ -1850,11 +2155,10 @@ def process_description(description_full: str) -> tuple[str, list]:
                             'short_summary': short_summary,
                             'long_summary': long_summary
                         })
+                    elif '<code>...</code>' in file_data:
+                        pass # PR with many files. some did not get analyzed
                     else:
-                        if '<code>...</code>' in file_data:
-                            pass # PR with many files. some did not get analyzed
-                        else:
-                            get_logger().warning("Failed to parse description", artifact={'description': file_data})
+                        get_logger().warning("Failed to parse description", artifact={'description': file_data})
                 except Exception as e:
                     get_logger().exception(f"Failed to process description: {e}", artifact={'description': file_data})
 

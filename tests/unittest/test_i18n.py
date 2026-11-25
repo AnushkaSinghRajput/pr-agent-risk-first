@@ -13,11 +13,11 @@ from pr_agent.algo.review_finding_state import append_review_state, parse_review
 from pr_agent.algo.run_details import init_run_details, record_ai_call, record_model_used
 from pr_agent.algo.run_output import show_run_details
 from pr_agent.algo.utils import convert_to_markdown_v2
+from pr_agent.commands.pr_reviewer import PRReviewer
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.bitbucket_provider import BitbucketProvider
 from pr_agent.git_providers.codecommit_provider import CodeCommitProvider
 from pr_agent.git_providers.git_provider import GitProvider
-from pr_agent.tools.pr_reviewer import PRReviewer
 from tests.unittest._settings_helpers import restore_settings, snapshot_settings
 
 
@@ -43,7 +43,40 @@ def catalog_dir(tmp_path, monkeypatch):
 
 
 def _placeholders(text):
-    return {name for _, name, _, _ in string.Formatter().parse(text) if name is not None}
+    fields = set()
+    for _, name, format_spec, conversion in string.Formatter().parse(text):
+        if name is None:
+            continue
+        if name.isidentifier():  # t() already stringifies direct replacements.
+            format_spec = "" if format_spec == "s" else format_spec
+            conversion = None if conversion == "s" else conversion
+        fields.add((name, format_spec, conversion))
+    return fields
+
+
+@pytest.mark.parametrize(("english", "translation"), [
+    ("{count}", "{count:.2}"),
+    ("{count}", "{count!r}"),
+    ("{count}", "{count:d}"),
+    ("{count}", "{count:{width}}"),
+    ("{count:{width}}", "{count:{w}}"),
+    ("{count} {count}", "{count} {count!r}"),
+    ("{name.__class__}", "{name.__class__:s}"),
+])
+def test_placeholder_formatting_differences_are_detected(english, translation):
+    assert _placeholders(english) != _placeholders(translation)
+
+
+@pytest.mark.parametrize(("english", "translation"), [
+    ("{name} {count}", "{count} {name}"),
+    ("{name}", "{name} {name}"),
+    ("{name!r} {count:.2}", "{count:.2} {name!r}"),
+    ("{name}", "{name!s}"),
+    ("{name}", "{name:s}"),
+    ("{name!r}", "{name!r:s}"),
+])
+def test_placeholder_reordering_and_repetition_are_allowed(english, translation):
+    assert _placeholders(english) == _placeholders(translation)
 
 
 def _flatten(path):
@@ -63,7 +96,10 @@ def _flatten(path):
 def test_shipped_catalog_matches_english_keys_and_placeholders(path):
     english = _flatten(i18n.CATALOG_DIR / "en.toml")
     catalog = _flatten(path)
-    assert set(catalog) <= set(english), f"keys missing from en.toml: {set(catalog) - set(english)}"
+    if path.stem in {"en", "es"}:
+        assert set(catalog) <= set(english), f"keys missing from en.toml: {set(catalog) - set(english)}"
+    else:
+        assert set(catalog) == set(english), f"{path.name}: catalog keys differ from en.toml"
     for key, text in catalog.items():
         assert _placeholders(text) == _placeholders(english[key]), key
 
@@ -73,7 +109,27 @@ def test_shipped_catalog_matches_english_keys_and_placeholders(path):
     ("es-AR", ["es", "en"]),
     ("ES_ar", ["es", "en"]),
     (" es ", ["es", "en"]),
-    ("pt-BR", ["en"]),
+    ("pt-BR", ["pt-br", "en"]),
+    ("PT_br", ["pt-br", "en"]),
+    ("pt-PT-x-private", ["pt-pt", "en"]),
+    ("zh_TW", ["zh-tw", "en"]),
+    ("zh-Hant-TW", ["zh-tw", "en"]),
+    ("ZH_hAnT_tw", ["zh-tw", "en"]),
+    ("zh-Hant", ["zh-tw", "en"]),
+    ("zh-Hant-HK", ["zh-tw", "en"]),
+    ("zh-Hans-CN", ["zh-cn", "en"]),
+    ("zh-Hans", ["zh-cn", "en"]),
+    ("zh-Hans-SG", ["zh-cn", "en"]),
+    ("zh-Hans-TW", ["zh-cn", "en"]),
+    ("zh-cmn-Hans-CN", ["zh-cn", "en"]),
+    ("zh-cmn-Hant-TW", ["zh-tw", "en"]),
+    ("cmn-Hans-CN", ["zh-cn", "en"]),
+    ("cmn-Hant-TW", ["zh-tw", "en"]),
+    ("zh-yue-Hant-HK", ["en"]),
+    ("zh-cmn", ["en"]),
+    ("zh", ["en"]),
+    ("AR_sa", ["ar", "en"]),
+    ("xx-YY", ["en"]),
     ("Spanish", ["en"]),
     ("../es", ["en"]),
     ("", ["en"]),
@@ -82,6 +138,23 @@ def test_shipped_catalog_matches_english_keys_and_placeholders(path):
 ])
 def test_locale_chain_drops_subtags_and_ends_in_english(value, expected):
     assert locale_chain(value) == expected
+
+
+@pytest.mark.parametrize(("locale", "expected"), [
+    ("zh-Hant-TW", "Traditional"),
+    ("zh-Hant", "Traditional"),
+    ("zh-Hans-CN", "Simplified"),
+    ("zh-Hans", "Simplified"),
+    ("zh-cmn-Hant-TW", "Traditional"),
+    ("zh-cmn-Hans-CN", "Simplified"),
+    ("cmn-Hans-CN", "Simplified"),
+])
+def test_chinese_script_tag_selects_localized_text(catalog_dir, language, locale, expected):
+    (catalog_dir / "en.toml").write_text('[demo]\ngreeting = "English {name}"\n', encoding="utf-8")
+    (catalog_dir / "zh-tw.toml").write_text('[demo]\ngreeting = "Traditional {name}"\n', encoding="utf-8")
+    (catalog_dir / "zh-cn.toml").write_text('[demo]\ngreeting = "Simplified {name}"\n', encoding="utf-8")
+    language(locale)
+    assert t("demo.greeting", name="Ada") == f"{expected} Ada"
 
 
 def test_lookup_falls_back_to_english_per_key(catalog_dir, language):
@@ -114,15 +187,20 @@ def _review(**fields):
 
 
 @pytest.mark.parametrize("gfm_supported", [True, False])
-def test_review_summary_renders_labels_in_the_response_language(language, gfm_supported):
-    language("es-AR")
+@pytest.mark.parametrize(("locale", "labels"), [
+    ("es-AR", ("Esfuerzo estimado de revisión", "Sin pruebas relevantes",
+               "No se identificaron problemas de seguridad", "Áreas recomendadas para revisar", "Posible problema")),
+    ("zh-TW", ("預估審查工作量", "未找到相關測試", "未發現資安疑慮", "建議優先審查的部分", "可能的問題")),
+    ("ar", ("الجهد المقدر للمراجعة", "لا توجد اختبارات ذات صلة", "لم تُكتشف مخاوف أمنية",
+            "مجالات التركيز الموصى بها للمراجعة", "مشكلة محتملة")),
+])
+def test_review_summary_renders_labels_in_the_response_language(language, gfm_supported, locale, labels):
+    language(locale)
     issue = {"relevant_file": "a.py", "issue_header": "Possible bug", "issue_content": "Leak.",
              "start_line": 1, "end_line": 1}
     output = convert_to_markdown_v2(_review(key_issues_to_review=[issue]), gfm_supported=gfm_supported)
 
-    for label in ("Esfuerzo estimado de revisión", "Sin pruebas relevantes",
-                  "No se identificaron problemas de seguridad", "Áreas recomendadas para revisar",
-                  "Posible problema"):
+    for label in labels:
         assert label in output
     for label in ("Estimated effort", "No relevant tests", "No security concerns", "Recommended focus",
                   "Possible Issue", "key observations"):
